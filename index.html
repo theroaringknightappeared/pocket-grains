@@ -162,9 +162,10 @@ function makeDummy(x,y){
 }
 const rnd=(a,b)=>a+Math.random()*(b-a);
 const clamp01=v=>v<0?0:v>1?1:v;
-// back to full health: no injuries, nothing broken
+// back to full health: fresh unmarked skin, nothing bleeding or broken
 function heal(d){
-  Object.assign(d,{health:100,dead:false,ko:false,spots:[],partDmg:{},legBroken:false,armBroken:{B:false,F:false},hpShow:0,hurtCool:0,lastDmg:0});
+  d.sprites=Object.fromEntries(SHAPES.map(sh=>[sh.key,buildSprite(sh)]));
+  Object.assign(d,{health:100,dead:false,ko:false,bleeders:[],partDmg:{},legBroken:false,armBroken:{B:false,F:false},hpShow:0,hurtCool:0,lastDmg:0});
 }
 
 // ---- balance: muscles ease each joint toward its standing pose, measured from the hip ----
@@ -264,50 +265,101 @@ function boxesTouch(a,b){
 
 // ---- damage ----
 const IMPACT=14;  // closing speed (px/step) before a hit hurts; small drops and bumps are harmless
-const CUT=16;     // damage at which the skin splits as well as bruising
+const CUT=14;     // damage at which a hit opens a wound that bleeds
 const KO_HIT=22;  // damage that knocks a dummy out cold (head hits need less)
 // falls over but stays awake; gets up when recover runs out
 function loseBalance(d,frames){d.strength=0;d.recover=Math.max(d.recover,frames)}
 function knockOut(d,frames){loseBalance(d,frames);d.ko=true}
 function die(d){d.health=0;d.dead=true;d.strength=0;d.ko=true}
-const angDiff=(a,b)=>Math.abs(Math.atan2(Math.sin(a-b),Math.cos(a-b)));
 // the exact spot on the skin that took the hit
 function contactPoint(d,c){
   const sh=c.sh,A=d.pts[sh.a],B=d.pts[sh.b],r=sh.key==='head'?A.r:sh.w*d.s/2;
   return {x:A.x+(B.x-A.x)*c.t+c.nx*r,y:A.y+(B.y-A.y)*c.t+c.ny*r};
 }
-// injuries are kept in the body part's own frame (along it, and which side) so they move with it
-function spotFrame(d,sh,t,nx,ny){
-  if(sh.key==='head'){const h=d.pts.head,n=d.pts.neck;return {ang:Math.atan2(ny,nx)-Math.atan2(h.y-n.y,h.x-n.x)}}
-  const A=d.pts[sh.a],B=d.pts[sh.b],dx=B.x-A.x,dy=B.y-A.y,len=Math.hypot(dx,dy)||1;
-  return {t:Math.min(.94,Math.max(.06,t)),side:(nx*-dy+ny*dx)/len}; // side: -1..1 across the limb
+
+// ---- pixel sprites: every body part is a little pixel image that turns with the limb ----
+const TEX=2; // body units per pixel
+const pxSize=()=>TEX*scale();
+const RGB={outline:[78,86,96],skin:[223,226,229],skinBack:[195,200,205],
+  blood:[168,18,28],wound:[124,12,20],deep:[58,6,10]};
+function spriteSize(sh){
+  if(sh.key==='head')return [10,10];
+  const [ax,ay]=SKELETON[sh.a],[bx,by]=SKELETON[sh.b];
+  return [Math.max(3,Math.round(sh.w/TEX)),Math.round((Math.hypot(bx-ax,by-ay)+sh.w)/TEX)];
 }
-function spotPos(d,sp){
-  if(sp.key==='head'){
-    const h=d.pts.head,n=d.pts.neck,a=Math.atan2(h.y-n.y,h.x-n.x)+sp.ang;
-    return {x:h.x+Math.cos(a)*h.r*.62,y:h.y+Math.sin(a)*h.r*.62,ang:a+Math.PI/2};
+function buildSprite(sh){
+  const [tw,th]=spriteSize(sh),head=sh.key==='head';
+  const cvs=document.createElement('canvas');cvs.width=tw;cvs.height=th;
+  const g=cvs.getContext('2d'),img=g.createImageData(tw,th),D=img.data;
+  // a block with its corners knocked off; the head more rounded than the limbs
+  const inside=(x,y)=>{
+    if(x<0||y<0||x>=tw||y>=th)return false;
+    const cx=Math.min(x,tw-1-x),cy=Math.min(y,th-1-y);
+    return head?cx+cy>=2:!(cx===0&&cy===0);
+  };
+  const base=sh.back?RGB.skinBack:RGB.skin;
+  for(let y=0;y<th;y++)for(let x=0;x<tw;x++){
+    if(!inside(x,y))continue;
+    const edge=!inside(x-1,y)||!inside(x+1,y)||!inside(x,y-1)||!inside(x,y+1);
+    let c=edge?RGB.outline:base;
+    if(!edge&&x===1)c=c.map(v=>Math.min(255,v+10));          // lit side
+    if(!edge&&x===tw-2&&tw>3)c=c.map(v=>Math.max(0,v-16));    // shaded side
+    const i=(y*tw+x)*4;D[i]=c[0];D[i+1]=c[1];D[i+2]=c[2];D[i+3]=255;
   }
-  const sh=SHAPE_BY_KEY[sp.key],A=d.pts[sh.a],B=d.pts[sh.b],dx=B.x-A.x,dy=B.y-A.y,len=Math.hypot(dx,dy)||1;
-  const off=sp.side*sh.w*d.s/2*.55;
-  return {x:A.x+dx*sp.t-dy/len*off,y:A.y+dy*sp.t+dx/len*off,ang:Math.atan2(dy,dx)};
+  g.putImageData(img,0,0);
+  return {cv:cvs,g,img,tw,th,head,state:new Uint8Array(tw*th),dirty:false};
 }
-// every hit bruises where it lands; hard ones split the skin there too, and that cut bleeds
+// where a sprite sits right now: centre, turn, and how big one of its pixels is on screen
+function spriteFrame(d,sh){
+  const sp=d.sprites[sh.key],px=TEX*d.s;
+  if(sh.key==='head'){const h=d.pts.head,n=d.pts.neck;return {sp,px,cx:h.x,cy:h.y,ang:Math.atan2(h.y-n.y,h.x-n.x)+Math.PI/2}}
+  const A=d.pts[sh.a],B=d.pts[sh.b];
+  return {sp,px,cx:(A.x+B.x)/2,cy:(A.y+B.y)/2,ang:Math.atan2(B.y-A.y,B.x-A.x)-Math.PI/2};
+}
+function toLocal(f,x,y){
+  const dx=x-f.cx,dy=y-f.cy,c=Math.cos(f.ang),s=Math.sin(f.ang);
+  return {lx:(dx*c+dy*s)/f.px+f.sp.tw/2,ly:(-dx*s+dy*c)/f.px+f.sp.th/2};
+}
+function toWorld(f,lx,ly){
+  const ux=(lx-f.sp.tw/2)*f.px,uy=(ly-f.sp.th/2)*f.px,c=Math.cos(f.ang),s=Math.sin(f.ang);
+  return {x:f.cx+ux*c-uy*s,y:f.cy+ux*s+uy*c};
+}
+// paint one pixel of a sprite; worse damage (higher level) covers milder marks, never the reverse
+function paint(sp,x,y,rgb,level){
+  x=Math.floor(x);y=Math.floor(y);
+  if(x<0||y<0||x>=sp.tw||y>=sp.th)return;
+  const k=y*sp.tw+x,i=k*4,D=sp.img.data;
+  if(!D[i+3]||sp.state[k]>=level)return;
+  const v=rnd(-10,10);
+  D[i]=Math.max(0,Math.min(255,rgb[0]+v));D[i+1]=rgb[1];D[i+2]=rgb[2];sp.state[k]=level;sp.dirty=true;
+}
+// a wound punched into the skin where it was hit: a dark hole, raw edges, blood flecks around it
+function woundAt(sp,lx,ly,dmg){
+  const R=dmg<20?.8:dmg<30?1.3:1.8;
+  for(let y=Math.floor(ly-R-2);y<=ly+R+2;y++)for(let x=Math.floor(lx-R-2);x<=lx+R+2;x++){
+    const dist=Math.hypot(x+.5-lx,y+.5-ly);
+    if(dist<=R*.6)paint(sp,x,y,RGB.deep,3);
+    else if(dist<=R)paint(sp,x,y,RGB.wound,2);
+    else if(dist<=R+1.3&&Math.random()<.5)paint(sp,x,y,RGB.blood,1);
+  }
+  for(let k=0;k<dmg/7;k++)paint(sp,lx+rnd(-3,3),ly+rnd(-3,3),RGB.blood,1);
+}
+
+// a hard enough hit opens a wound exactly where it landed, and that wound bleeds
 function hurtAt(d,c,dmg){
-  const sh=c.sh,f=spotFrame(d,sh,c.t,c.nx,c.ny),cut=dmg>=CUT;
-  // the same spot hit again gets worse instead of a new mark appearing next to it
-  let sp=d.spots.find(o=>o.key===sh.key&&(sh.key==='head'?angDiff(o.ang,f.ang)<.5:Math.abs(o.t-f.t)<.14&&Math.abs(o.side-f.side)<.8));
-  if(!sp){
-    // each mark gets its own uneven shape: a few overlapping blotches, and a ragged line for a cut
-    const blobs=Array.from({length:4},()=>({u:rnd(-.45,.45),v:rnd(-.3,.3),r:rnd(.45,.8)}));
-    const jag=Array.from({length:6},()=>rnd(-.35,.35));
-    sp={key:sh.key,...f,bruise:0,cut:0,bleed:0,age:0,trail:0,blobs,jag,tilt:rnd(-.35,.35)};
-    d.spots.push(sp);if(d.spots.length>40)d.spots.shift();
-  }
-  sp.bruise=Math.min(1.5,sp.bruise+dmg/28);sp.age=Math.min(sp.age,30);
-  const {x,y}=contactPoint(d,c);
+  const sh=c.sh,cut=dmg>=CUT,cp=contactPoint(d,c);
   if(cut){
-    sp.cut=Math.min(1.2,sp.cut+dmg/40);sp.bleed=Math.min(1,sp.bleed+dmg*.012);
-    spray(x,y,c.nx,c.ny,dmg,d.s);
+    const f=spriteFrame(d,sh),sp=f.sp;
+    let {lx,ly}=toLocal(f,cp.x,cp.y);
+    // keep the wound on the skin, just inside the edge that took the hit
+    lx=Math.max(.5,Math.min(sp.tw-.5,lx));ly=Math.max(.5,Math.min(sp.th-.5,ly));
+    if(Math.abs(lx-sp.tw/2)>.8)lx+=Math.sign(sp.tw/2-lx)*.8;
+    if(sp.head&&Math.abs(ly-sp.th/2)>.8)ly+=Math.sign(sp.th/2-ly)*.8;
+    woundAt(sp,lx,ly,dmg);
+    const near=d.bleeders.find(b=>b.key===sh.key&&Math.hypot(b.lx-lx,b.ly-ly)<2);
+    if(near)near.bleed=Math.min(1,near.bleed+dmg*.012);
+    else d.bleeders.push({key:sh.key,lx,ly,bleed:Math.min(1,dmg*.012),trail:0,tick:0});
+    spray(cp.x,cp.y,c.nx,c.ny,dmg);
   }
   thud(Math.min(.9,.2+dmg/40),cut);
   if(dmg>=KO_HIT)shake=Math.max(shake,Math.min(9,dmg*.25));
@@ -325,7 +377,28 @@ function hurtAt(d,c,dmg){
   else if(dmg>=6)loseBalance(d,50);
   if(d.health<=0)die(d);
 }
-// each step: the worst hit hurts, cuts bleed, knockdowns, and getting back up
+// wounds pour a thin stream of blood and stain the skin below them until they clot
+function bleed(d){
+  let total=0;
+  for(const b of d.bleeders){
+    if(b.bleed<=.01)continue;
+    total+=b.bleed;
+    const f=spriteFrame(d,SHAPE_BY_KEY[b.key]);
+    if(Math.random()<b.bleed*.55){
+      const w=toWorld(f,b.lx,b.ly);
+      drops.push({x:w.x,y:w.y,vx:rnd(-.25,.25),vy:rnd(0,.6),k:rnd(.5,.8),c:BLOOD[Math.random()*3|0]});
+    }
+    // blood runs down the skin (down on screen, whichever way the limb is turned)
+    if(++b.tick%7===0&&b.trail<14){
+      b.trail++;
+      const s=Math.sin(f.ang),c=Math.cos(f.ang);
+      paint(f.sp,b.lx+s*b.trail+rnd(-.4,.4),b.ly+c*b.trail,RGB.blood,1);
+    }
+    b.bleed*=d.dead?.996:.998;
+  }
+  if(total&&!d.dead){d.health-=total*.012;if(d.health<=0)die(d)}
+}
+// each step: the worst hit hurts, wounds bleed, knockdowns, and getting back up
 function updateDummy(d,grabbed){
   const P=d.pts;
   let jolt=0;
@@ -348,17 +421,7 @@ function updateDummy(d,grabbed){
     if(extra>2){hurtAt(d,best,extra);d.lastDmg=d.hurtCool>0?Math.max(d.lastDmg,bestDmg):bestDmg}
     d.hurtCool=30; // about half a second: a whole crash counts as one event
   }else if(loudest>7)thud(Math.min(.22,(loudest-7)*.03),false); // harmless bump
-  // cuts drip and drain health until they clot
-  let bleed=0;
-  for(const sp of d.spots){
-    sp.age++;
-    if(sp.bleed>.01){
-      bleed+=sp.bleed;if(Math.random()<sp.bleed*.25)drip(d,sp);
-      sp.trail=Math.min(1,sp.trail+sp.bleed*.004); // blood runs down the skin from the cut
-      sp.bleed*=d.dead?.996:.998;
-    }
-  }
-  if(bleed&&!d.dead){d.health-=bleed*.012;if(d.health<=0)die(d)}
+  bleed(d);
   if(d.hpShow>0)d.hpShow--;
   if(d.blink--<-7)d.blink=rnd(90,300);
   if(d.dead){d.strength=0;return}
@@ -376,34 +439,37 @@ function updateDummy(d,grabbed){
   if(d.strength>cap)d.strength=cap;
 }
 
-// ---- blood ----
-let drops=[],splats=[],wallSplats=[],shake=0;
-const BLOOD=['#a5121d','#8c0d16','#c21b26'];
-// blood bursts out of the hit spot, away from whatever was hit
-function spray(x,y,nx,ny,dmg,s){
-  const n=Math.min(34,6+dmg*.8|0),tx=-ny,ty=nx;
+// ---- blood: square drops, pools that spread along the floor, stains that run down the walls ----
+let drops=[],pool=new Float32Array(0),wallL=new Float32Array(0),wallR=new Float32Array(0),shake=0;
+const BLOOD=['#a5121d','#8c0d16','#b8151f'];
+function resetPools(){
+  const px=pxSize(),rows=Math.ceil(groundY/px)+2;
+  pool=new Float32Array(Math.ceil(VW/px)+2);wallL=new Float32Array(rows);wallR=new Float32Array(rows);
+}
+// a burst out of the wound, away from whatever was hit
+function spray(x,y,nx,ny,dmg){
+  const n=Math.min(30,5+dmg*.7|0),tx=-ny,ty=nx;
   for(let i=0;i<n;i++){
-    const out=rnd(1,5),side=rnd(-3.5,3.5);
-    drops.push({x:x-nx*2,y:y-ny*2,vx:-nx*out+tx*side,vy:-ny*out+ty*side-rnd(0,2.5),r:rnd(.7,1.6)*s,c:BLOOD[i%3]});
+    const out=rnd(.8,4.5),side=rnd(-2.5,2.5);
+    drops.push({x:x-nx*2,y:y-ny*2,vx:-nx*out+tx*side,vy:-ny*out+ty*side-rnd(0,2),k:Math.random()<.3?1:.6,c:BLOOD[i%3]});
   }
 }
-function drip(d,sp){
-  const {x,y}=spotPos(d,sp);
-  drops.push({x,y,vx:rnd(-.4,.4),vy:rnd(0,1),r:rnd(.7,1.3)*d.s,c:BLOOD[Math.random()*3|0]});
-}
 function updateBlood(){
+  const px=pxSize();
   for(const q of drops){
     q.vy+=GRAVITY*.8;q.x+=q.vx;q.y+=q.vy;
-    if(q.y>=groundY){ // lands as a puddle on the floor
-      splats.push({x:q.x,w:q.r*rnd(1.6,3.2),h:q.r*rnd(.45,.8),c:q.c});q.dead=true;
-    }else if(q.x<=0||q.x>=VW){ // or a streak on the wall
-      wallSplats.push({x:q.x<=0?0:VW,y:q.y,w:q.r*rnd(.5,.8),h:q.r*rnd(1.4,3),c:q.c});q.dead=true;
+    if(q.y>=groundY-px*.3){
+      const i=Math.floor(q.x/px);if(i>=0&&i<pool.length)pool[i]+=q.k;q.dead=true;
+    }else if(q.x<=0||q.x>=VW){
+      const j=Math.floor(q.y/px),w=q.x<=0?wallL:wallR;if(j>=0&&j<w.length)w[j]+=q.k;q.dead=true;
     }
   }
   drops=drops.filter(q=>!q.dead);
-  if(drops.length>700)drops.splice(0,drops.length-700);
-  if(splats.length>500)splats.splice(0,splats.length-500);
-  if(wallSplats.length>300)wallSplats.splice(0,wallSplats.length-300);
+  if(drops.length>800)drops.splice(0,drops.length-800);
+  // a pool creeps outward along the floor until it's thin
+  for(let i=1;i<pool.length-1;i++){const e=pool[i]-.5;if(e>0){const m=e*.03;pool[i]-=2*m;pool[i-1]+=m;pool[i+1]+=m}}
+  // and a wall stain slowly runs downward
+  for(const w of [wallL,wallR])for(let j=w.length-2;j>=0;j--){const e=w[j]-.8;if(e>0){const m=e*.01;w[j]-=m;w[j+1]+=m}}
 }
 
 // ---- sound: a soft thud for bumps, a heavier one with a wet slap for cuts ----
@@ -518,132 +584,77 @@ function step(){
 }
 
 // ---- drawing ----
-function limb(a,b,w,fill){
-  ctx.lineCap='round';
-  ctx.strokeStyle=COL.outline;ctx.lineWidth=w+2.5;
-  ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
-  ctx.strokeStyle=fill;ctx.lineWidth=w;
-  ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
-}
-function jointDot(p,r){ctx.fillStyle=COL.joint;ctx.beginPath();ctx.arc(p.x,p.y,r,0,Math.PI*2);ctx.fill()}
-// outline of a limb (a capsule) or the head, used to keep injuries painted on the skin
-function partPath(a,b,half){
-  ctx.beginPath();
-  if(a===b){ctx.arc(a.x,a.y,a.r,0,Math.PI*2);return}
-  const ang=Math.atan2(b.y-a.y,b.x-a.x);
-  ctx.arc(b.x,b.y,half,ang-Math.PI/2,ang+Math.PI/2);
-  ctx.arc(a.x,a.y,half,ang+Math.PI/2,ang+Math.PI*1.5);
-  ctx.closePath();
-}
-function drawSpots(d,sh,A,B,half){
-  const list=d.spots.filter(o=>o.key===sh.key);
-  if(!list.length)return;
-  ctx.save();partPath(A,B,half);ctx.clip();
-  for(const sp of list){
-    const {x,y,ang}=spotPos(d,sp),base=sh.key==='head'?A.r*.55:half;
-    const cutL=base*(.45+.5*Math.min(1,sp.cut)),cutW=Math.max(.8,base*(.09+.09*Math.min(1,sp.cut)));
-    if(sp.trail>0){ // blood that ran down the skin from the cut: bright while it flows, darker once it stops
-      const len=base*4.5*sp.trail,w=cutW*1.3;
-      ctx.strokeStyle=sp.bleed>.05?'rgba(150,16,26,.85)':'rgba(105,14,22,.8)';ctx.lineCap='round';
-      for(const [dx,f] of [[-cutL*.3,1],[cutL*.25,.6]]){
-        const sx=x+Math.cos(ang)*dx,sy=y+Math.sin(ang)*dx;
-        ctx.lineWidth=w*f;ctx.beginPath();ctx.moveTo(sx,sy);
-        ctx.quadraticCurveTo(sx+w*sp.tilt*3,sy+len*f*.5,sx+w*sp.tilt*1.5,sy+len*f);ctx.stroke();
-        ctx.fillStyle=ctx.strokeStyle;ctx.beginPath();ctx.arc(sx+w*sp.tilt*1.5,sy+len*f,w*f*.75,0,Math.PI*2);ctx.fill(); // drop at the tip
-      }
-    }
-    ctx.save();ctx.translate(x,y);ctx.rotate(ang+sp.tilt);
-    if(sp.bruise>0){ // blotchy: reddish when fresh, purple after a few seconds, bluer later
-      const k=Math.min(1,sp.age/300),k2=Math.min(1,Math.max(0,(sp.age-300)/1500));
-      const r=185-80*k-25*k2|0,g=70-10*k+10*k2|0,b=95+35*k+5*k2|0;
-      const R=base*(.5+.38*Math.min(1.2,sp.bruise)),a=.2+.22*Math.min(1,sp.bruise);
-      for(const bl of sp.blobs){
-        const bx=bl.u*R,by=bl.v*R,br=R*bl.r;
-        const gr=ctx.createRadialGradient(bx,by,0,bx,by,br);
-        gr.addColorStop(0,`rgba(${r},${g},${b},${a})`);gr.addColorStop(1,`rgba(${r},${g},${b},0)`);
-        ctx.fillStyle=gr;ctx.beginPath();ctx.arc(bx,by,br,0,Math.PI*2);ctx.fill();
-      }
-    }
-    if(sp.cut>0){ // a ragged split in the skin, wet-looking while it bleeds
-      const J=sp.jag,n=J.length;
-      const path=()=>{ctx.beginPath();for(let i=0;i<n;i++){const u=-cutL+2*cutL*i/(n-1);i?ctx.lineTo(u,J[i]*cutW*2):ctx.moveTo(u,J[i]*cutW*2)}};
-      ctx.lineCap=ctx.lineJoin='round';
-      ctx.strokeStyle='rgba(120,20,35,.35)';ctx.lineWidth=cutW*4.5;path();ctx.stroke(); // swollen edge
-      ctx.strokeStyle='#4a070c';ctx.lineWidth=cutW*2.2;path();ctx.stroke();
-      ctx.strokeStyle=sp.bleed>.05?'#c0161f':'#7d0d14';ctx.lineWidth=cutW;path();ctx.stroke();
-    }
-    ctx.restore();
-  }
-  ctx.restore();
-}
-// eyes look toward the side the dummy faces; closed when knocked out or dead
-function drawEyes(d){
-  const h=d.pts.head,n=d.pts.neck,r=h.r;
-  const ux=h.x-n.x,uy=h.y-n.y,ul=Math.hypot(ux,uy)||1;
-  const upx=ux/ul,upy=uy/ul,rx=-upy*d.face,ry=upx*d.face; // head's "up" and "forward"
-  const closed=d.ko||d.dead||d.blink<0;
-  ctx.strokeStyle=ctx.fillStyle='#2b3138';ctx.lineCap='round';ctx.lineWidth=Math.max(1.2,r*.12);
-  for(const off of [.08,.52]){
-    const ex=h.x+rx*off*r+upx*.12*r,ey=h.y+ry*off*r+upy*.12*r;
-    ctx.beginPath();
-    if(closed){ // a short lid line across the eye
-      ctx.moveTo(ex-rx*r*.13,ey-ry*r*.13);ctx.lineTo(ex+rx*r*.13,ey+ry*r*.13);ctx.stroke();
-    }else{
-      ctx.ellipse(ex,ey,r*.11,r*.18,Math.atan2(upy,upx)+Math.PI/2,0,Math.PI*2);ctx.fill();
-    }
+// eyes are pixels in the head sprite's own grid, on the side the dummy faces; shut when out cold or dead
+function drawEyes(d,sp,px){
+  const closed=d.ko||d.dead||d.blink<0,cx=sp.tw/2,cy=sp.th/2;
+  ctx.fillStyle='#262b31';
+  for(const off of [1,3]){
+    const col=d.face>0?cx+off-1:cx-off;
+    if(closed)ctx.fillRect((col-cx)*px,(4-cy)*px,px,px);
+    else ctx.fillRect((col-cx)*px,(3-cy)*px,px,2*px);
   }
 }
 function drawHealth(d){
   if(d.hpShow<=0||d.dead)return;
-  const h=d.pts.head,w=40,x=h.x-w/2,y=h.y-h.r-14;
+  const h=d.pts.head,px=TEX*d.s,w=Math.round(12*px/2)*2/2,x=h.x-w/2,y=h.y-h.r-4*px;
   ctx.globalAlpha=Math.min(1,d.hpShow/30);
-  ctx.fillStyle='rgba(0,0,0,.45)';ctx.fillRect(x-1,y-1,w+2,6);
+  ctx.fillStyle='rgba(0,0,0,.5)';ctx.fillRect(x-px/2,y-px/2,w+px,px*1.5);
   ctx.fillStyle=d.health>50?'#6cc24a':d.health>25?'#f2b544':'#e5533d';
-  ctx.fillRect(x,y,w*d.health/100,4);
+  ctx.fillRect(x,y,w*d.health/100,px*.6);
   ctx.globalAlpha=1;
 }
 function drawDummy(d){
-  const P=d.pts,s=d.s;
+  ctx.imageSmoothingEnabled=false; // keep the pixels crisp
   for(const sh of SHAPES){
-    const A=P[sh.a],B=P[sh.b];
-    if(sh.key==='head'){
-      ctx.fillStyle=COL.outline;ctx.beginPath();ctx.arc(A.x,A.y,A.r+1.25,0,Math.PI*2);ctx.fill();
-      ctx.fillStyle=COL.body;ctx.beginPath();ctx.arc(A.x,A.y,A.r,0,Math.PI*2);ctx.fill();
-      drawSpots(d,sh,A,A,A.r);drawEyes(d);
-      continue;
-    }
-    limb(A,B,sh.w*s,sh.back?COL.bodyBack:COL.body);
-    drawSpots(d,sh,A,B,sh.w*s/2);
-    if(sh.b==='footF')jointDot(P.kneeF,1.6*s);
-    if(sh.b==='handF')jointDot(P.elbowF,1.4*s);
+    const f=spriteFrame(d,sh),sp=f.sp;
+    if(sp.dirty){sp.g.putImageData(sp.img,0,0);sp.dirty=false}
+    // limbs stretch a little in the physics; draw each one to its current length so joints stay covered
+    let h=sp.th*f.px;
+    if(!sp.head){const A=d.pts[sh.a],B=d.pts[sh.b];h=Math.hypot(B.x-A.x,B.y-A.y)+sh.w*d.s}
+    ctx.save();ctx.translate(f.cx,f.cy);ctx.rotate(f.ang);
+    ctx.drawImage(sp.cv,-sp.tw*f.px/2,-h/2,sp.tw*f.px,h);
+    if(sp.head)drawEyes(d,sp,f.px);
+    ctx.restore();
   }
 }
-// glow around the body part a finger is holding
+// outline around the body part a finger is holding
 function drawGrab(g){
-  const s=g.d.s;
-  ctx.globalAlpha=.45;ctx.strokeStyle=COL.grab;ctx.lineCap='round';
-  if(g.a===g.b){
-    ctx.lineWidth=4;ctx.beginPath();ctx.arc(g.a.x,g.a.y,g.a.r+4,0,Math.PI*2);ctx.stroke();
-  }else{
-    ctx.lineWidth=g.w*s+8;ctx.beginPath();ctx.moveTo(g.a.x,g.a.y);ctx.lineTo(g.b.x,g.b.y);ctx.stroke();
-  }
-  ctx.globalAlpha=1;
+  const sh=SHAPES.find(s=>g.d.pts[s.a]===g.a&&g.d.pts[s.b]===g.b);if(!sh)return;
+  const f=spriteFrame(g.d,sh),sp=f.sp;
+  let h=sp.th*f.px;
+  if(!sp.head)h=Math.hypot(g.b.x-g.a.x,g.b.y-g.a.y)+sh.w*g.d.s;
+  ctx.save();ctx.translate(f.cx,f.cy);ctx.rotate(f.ang);
+  ctx.globalAlpha=.8;ctx.strokeStyle=COL.grab;ctx.lineWidth=Math.max(2,f.px*.5);
+  ctx.strokeRect(-sp.tw*f.px/2-f.px*.5,-h/2-f.px*.5,sp.tw*f.px+f.px,h+f.px);
+  ctx.restore();
 }
 function draw(){
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.fillStyle=COL.sky;ctx.fillRect(0,0,VW,VH);
   // a hard hit shakes the view for a moment
   if(shake>.3){ctx.translate(rnd(-shake,shake),rnd(-shake,shake));shake*=.85}else shake=0;
-  ctx.strokeStyle=COL.grid;ctx.lineWidth=1;ctx.beginPath();
-  for(let x=40;x<VW;x+=40){ctx.moveTo(x+.5,0);ctx.lineTo(x+.5,groundY)}
-  for(let y=groundY-40;y>0;y-=40){ctx.moveTo(0,y+.5);ctx.lineTo(VW,y+.5)}
-  ctx.stroke();
+  const px=pxSize();
+  // tiled back wall and a two-tone floor edge, in the same pixel size as the dummies
+  const tile=px*16;
+  ctx.fillStyle=COL.grid;
+  for(let x=tile;x<VW;x+=tile)ctx.fillRect(Math.round(x),0,Math.max(1,px*.5),groundY);
+  for(let y=groundY-tile;y>0;y-=tile)ctx.fillRect(0,Math.round(y),VW,Math.max(1,px*.5));
   ctx.fillStyle=COL.ground;ctx.fillRect(0,groundY,VW,VH-groundY);
-  ctx.fillStyle=COL.groundTop;ctx.fillRect(0,groundY,VW,3);
-  for(const sp of splats){ctx.fillStyle=sp.c;ctx.beginPath();ctx.ellipse(sp.x,groundY+1,sp.w,sp.h,0,0,Math.PI*2);ctx.fill()}
-  for(const sp of wallSplats){ctx.fillStyle=sp.c;ctx.beginPath();ctx.ellipse(sp.x,sp.y,sp.w,sp.h,0,0,Math.PI*2);ctx.fill()}
+  ctx.fillStyle=COL.groundTop;ctx.fillRect(0,groundY,VW,px);
+  ctx.fillStyle='#343a43';ctx.fillRect(0,groundY+px,VW,px);
+  // stains on the walls, pools on the floor: thicker blood is darker
+  for(const [w,left] of [[wallL,true],[wallR,false]])for(let j=0;j<w.length;j++){
+    const a=w[j];if(a<.35)continue;
+    const ww=(a<2?1:2)*px;ctx.fillStyle=a<2?'#8e111a':'#6e0c13';
+    ctx.fillRect(left?0:VW-ww,j*px,ww,px+.5);
+  }
+  for(let i=0;i<pool.length;i++){
+    const a=pool[i];if(a<.2)continue;
+    const h=a<5?1:2;ctx.fillStyle=a<2.5?'#8e111a':a<8?'#780e16':'#600a11';
+    ctx.fillRect(i*px,groundY-(h-.5)*px,px+.5,h*px);
+  }
   for(const d of dummies)drawDummy(d);
-  for(const q of drops){ctx.fillStyle=q.c;ctx.beginPath();ctx.arc(q.x,q.y,q.r,0,Math.PI*2);ctx.fill()}
+  for(const q of drops){const s=px*q.k;ctx.fillStyle=q.c;ctx.fillRect(q.x-s/2,q.y-s/2,s,s)}
   for(const g of grabs.values())drawGrab(g);
   for(const d of dummies)drawHealth(d);
 }
@@ -656,6 +667,7 @@ function fit(){
   cv.width=Math.round(VW*dpr);cv.height=Math.round(VH*dpr);
   cv.style.width=VW+'px';cv.style.height=VH+'px';
   groundY=VH-GROUND_H;
+  if(ow!==VW||oh!==VH)resetPools();
   // keep dummies standing on the ground when the screen rotates
   if(oh&&oh!==VH){const dy=(VH-oh);for(const d of dummies)for(const p of d.list){p.y+=dy;p.py+=dy}}
   if(ow&&ow!==VW){for(const d of dummies)for(const p of d.list){p.x=Math.min(p.x,VW-p.r);p.px=Math.min(p.px,VW-p.r)}}
@@ -747,7 +759,7 @@ slowBtn.addEventListener('click',()=>{slow=!slow;slowBtn.textContent=slow?'¼×'
 const clearBtn=document.getElementById('clearBtn');let armed=0;
 function showClear(){clearBtn.innerHTML=armed?'Tap to clear':ICON_TRASH;clearBtn.classList.toggle('warn',!!armed)}
 clearBtn.addEventListener('click',()=>{
-  if(armed){clearTimeout(armed);armed=0;dummies=[];drops=[];splats=[];wallSplats=[];grabs.clear()}
+  if(armed){clearTimeout(armed);armed=0;dummies=[];drops=[];resetPools();grabs.clear()}
   else armed=setTimeout(()=>{armed=0;showClear()},2500);
   showClear();
 });showClear();
@@ -787,7 +799,7 @@ function drawBlended(t){
 fit();
 new ResizeObserver(fit).observe(stage);
 makeDummy(VW*.5,groundY-(SKELETON.footF[1]+RADIUS.footF)*scale()); // standing on the ground
-window.__yard={dummies:()=>dummies,groundY:()=>groundY,pick,blood:()=>({drops:drops.length,splats:splats.length,wall:wallSplats.length}),SHAPES}; // for testing from the console
+window.__yard={dummies:()=>dummies,groundY:()=>groundY,pick,blood:()=>({drops:drops.length,pool:+pool.reduce((a,b)=>a+b,0).toFixed(1),wall:+[...wallL,...wallR].reduce((a,b)=>a+b,0).toFixed(1)}),SHAPES}; // for testing from the console
 requestAnimationFrame(frame);
 
 // cache the game on the device so it opens with no connection

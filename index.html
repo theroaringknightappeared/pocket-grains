@@ -137,10 +137,17 @@ function makeDummy(x,y){
   const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
   for(const [a,b] of BONES)sticks.push({a:pts[a],b:pts[b],len:dist(pts[a],pts[b]),type:'fixed'});
   for(const [a,b,type,f] of BRACES)sticks.push({a:pts[a],b:pts[b],len:dist(pts[a],pts[b])*(f||1),type,stiff:type==='fixed'?.5:1});
-  for(const p of Object.values(pts)){p.vx=0;p.vy=0}
-  const d={pts,list:Object.values(pts),sticks,s,strength:1,recover:0};
+  for(const [k,p] of Object.entries(pts)){p.vx=0;p.vy=0;p.hit=false;p.key=k}
+  const d={pts,list:Object.values(pts),sticks,s,strength:1,recover:0,
+    face:Math.random()<.5?-1:1,blink:rnd(60,240)};
+  heal(d);
   dummies.push(d);
   return d;
+}
+const rnd=(a,b)=>a+Math.random()*(b-a);
+// back to full health: no wounds, no bleeding, nothing broken
+function heal(d){
+  Object.assign(d,{health:100,dead:false,ko:false,bleed:0,wounds:[],partDmg:{},legBroken:false,armBroken:{B:false,F:false},hpShow:0,hurtCool:0,lastHit:0});
 }
 
 // ---- balance: muscles ease each joint toward its standing pose, measured from the hip ----
@@ -158,22 +165,110 @@ function balance(d){
     for(const p of d.list)if(p!==P.footB&&p!==P.footF)p.y-=GRAVITY*st;
     pull(P.hip,(P.footB.x+P.footF.x)/2,groundY-footR-SKELETON.footF[1]*s,.15*st);
   }
-  for(const k in MUSCLE)pull(P[k],P.hip.x+SKELETON[k][0]*s,P.hip.y+SKELETON[k][1]*s,MUSCLE[k]*st);
-}
-// knocked down by a hard hit, then slowly gets back up
-function updateStrength(d,grabbed){
-  let jolt=0;
-  for(const k of ['hip','neck','head']){
-    const p=d.pts[k],vx=p.x-p.px,vy=p.y-p.py;
-    jolt=Math.max(jolt,Math.hypot(vx-p.vx,vy-p.vy));
-    p.vx=vx;p.vy=vy;
+  for(const k in MUSCLE){
+    if(d.armBroken.B&&(k==='elbowB'||k==='handB')||d.armBroken.F&&(k==='elbowF'||k==='handF'))continue; // broken arms dangle
+    pull(P[k],P.hip.x+SKELETON[k][0]*s,P.hip.y+SKELETON[k][1]*s,MUSCLE[k]*st);
   }
+}
+
+// ---- damage: parts that slam into the ground, walls or another dummy get hurt ----
+const IMPACT=9; // speed change (px/step) a hit needs before it hurts
+function knockOut(d,frames){d.strength=0;d.ko=true;d.recover=Math.max(d.recover,frames)}
+function hurt(d,p,dmg){
+  if(p.key==='head')dmg*=1.4;
+  spray(p,dmg,d.s);
+  addWound(d,p,dmg);
+  d.bleed=Math.min(2,d.bleed+dmg*.015);
+  if(d.dead)return;
+  d.health-=dmg;d.hpShow=150;
+  if(dmg>14)knockOut(d,Math.min(420,90+dmg*5));
+  if(d.health<=0)die(d);
+}
+function die(d){d.health=0;d.dead=true;d.strength=0;d.ko=true}
+// a wound sits on one of the body parts that meet at the joint that was hit
+function addWound(d,p,dmg){
+  const s=d.s;
+  if(p.key==='head'){
+    const ang=rnd(0,Math.PI*2),dist=rnd(0,.6)*p.r;
+    d.wounds.push({key:'head',ang,dist,r:Math.min(p.r*.35,(1.5+dmg*.08)*s)});
+  }else{
+    const opts=PARTS.filter(([a,b])=>a!==b&&(a===p.key||b===p.key));
+    const [a,b,w]=opts[Math.random()*opts.length|0];
+    const t=a===p.key?rnd(0,.3):rnd(.7,1);
+    const key=a+'-'+b;
+    d.wounds.push({key,a,b,t,r:Math.min(w*s*.42,(1.5+dmg*.08)*s)});
+    d.partDmg[key]=(d.partDmg[key]||0)+dmg;
+    if(d.partDmg[key]>45){
+      if(/knee|foot/.test(key))d.legBroken=true;
+      if(/elbowB|handB/.test(key))d.armBroken.B=true;
+      if(/elbowF|handF/.test(key))d.armBroken.F=true;
+    }
+  }
+  if(d.wounds.length>40)d.wounds.shift();
+}
+// each step: impact damage, bleeding, knockdowns, and getting back up
+function updateDummy(d,grabbed){
+  const P=d.pts;
+  let jolt=0,worst=0,at=null;
+  for(const p of d.list){
+    const vx=p.x-p.px,vy=p.y-p.py,j=Math.hypot(vx-p.vx,vy-p.vy);
+    if((p===P.hip||p===P.neck||p===P.head)&&j>jolt)jolt=j;
+    // an impact is speed lost against something; being yanked by a finger speeds a part up instead
+    const lost=Math.hypot(p.vx,p.vy)-Math.hypot(vx,vy);
+    if(p.hit&&lost>worst){worst=lost;at=p}
+    p.vx=vx;p.vy=vy;p.hit=false;
+  }
+  // one slam bounces for a few steps; only a harder follow-up hit counts again
+  if(d.hurtCool>0)d.hurtCool--;
+  if(worst>IMPACT&&(d.hurtCool<=0||worst>d.lastHit+4)){
+    hurt(d,at,Math.min(45,(worst-IMPACT)*1.6));    d.hurtCool=12;d.lastHit=worst;
+  }
+  // bleeding drains health and drips from the wounds
+  if(d.bleed>.02){
+    if(!d.dead){d.health-=d.bleed*.012;if(d.health<=0)die(d)}
+    if(Math.random()<d.bleed*.15&&d.wounds.length)drip(d,d.wounds[Math.random()*d.wounds.length|0]);
+    d.bleed*=d.dead?.996:.998;
+  }
+  if(d.hpShow>0)d.hpShow--;
+  if(d.blink--<-7)d.blink=rnd(90,300);
+  if(d.dead){d.strength=0;return}
   // a hard landing buckles the legs
-  const P=d.pts,footY=groundY-P.footF.r-2;
+  const footY=groundY-P.footF.r-2;
   const landing=(P.footB.y>footY||P.footF.y>footY)&&P.hip.vy>8;
-  if(grabbed||jolt>KNOCKDOWN||landing){d.strength=0;d.recover=grabbed?40:90;return}
-  if(d.recover>0)d.recover--;
-  else d.strength=Math.min(1,d.strength+.012);
+  if(grabbed){d.strength=0;d.recover=Math.max(d.recover,40);return} // limp in your hand, but awake
+  if(jolt>KNOCKDOWN||landing)knockOut(d,90);
+  if(d.recover>0){d.recover--;return}
+  d.ko=false; // eyes open, starts getting up
+  if(!d.legBroken)d.strength=Math.min(1,d.strength+.012);
+}
+
+// ---- blood ----
+let drops=[],splats=[];
+const BLOOD=['#a5121d','#8c0d16','#c21b26'];
+function spray(p,dmg,s){
+  const n=Math.min(40,4+dmg*1.2|0);
+  for(let i=0;i<n;i++)drops.push({x:p.x,y:p.y,vx:rnd(-3.5,3.5)+p.vx*.25,vy:rnd(-6,1)+p.vy*.15,r:rnd(.8,1.8)*s,c:BLOOD[i%3]});
+}
+function woundPos(d,w){
+  if(w.key==='head'){const h=d.pts.head;return {x:h.x+Math.cos(w.ang)*w.dist,y:h.y+Math.sin(w.ang)*w.dist}}
+  const a=d.pts[w.a],b=d.pts[w.b];
+  return {x:a.x+(b.x-a.x)*w.t,y:a.y+(b.y-a.y)*w.t};
+}
+function drip(d,w){
+  const {x,y}=woundPos(d,w);
+  drops.push({x,y,vx:rnd(-.4,.4),vy:rnd(0,1),r:rnd(.7,1.3)*d.s,c:BLOOD[Math.random()*3|0]});
+}
+function updateBlood(){
+  for(const q of drops){
+    q.vy+=GRAVITY*.8;q.x+=q.vx;q.y+=q.vy;
+    if(q.y>=groundY){ // lands as a splat on the floor
+      splats.push({x:q.x,w:q.r*rnd(1.6,3.2),h:q.r*rnd(.45,.8),c:q.c});
+      q.dead=true;
+    }else if(q.x<-20||q.x>VW+20)q.dead=true;
+  }
+  drops=drops.filter(q=>!q.dead);
+  if(drops.length>700)drops.splice(0,drops.length-700);
+  if(splats.length>500)splats.splice(0,splats.length-500);
 }
 
 function integrate(p){
@@ -184,12 +279,12 @@ function integrate(p){
 }
 function bounds(p){
   if(p.y>groundY-p.r){
-    p.y=groundY-p.r;
+    p.y=groundY-p.r;p.hit=true;
     p.px=p.x-(p.x-p.px)*.75; // ground friction
     if(p.py<p.y)p.py=p.y;     // no bounce
   }
-  if(p.x<p.r){p.x=p.r;p.px=p.x+(p.x-p.px)*-.3}
-  if(p.x>VW-p.r){p.x=VW-p.r;p.px=p.x+(p.x-p.px)*-.3}
+  if(p.x<p.r){p.x=p.r;p.px=p.x+(p.x-p.px)*-.3;p.hit=true}
+  if(p.x>VW-p.r){p.x=VW-p.r;p.px=p.x+(p.x-p.px)*-.3;p.hit=true}
 }
 function solveStick(st){
   const a=st.a,b=st.b,dx=b.x-a.x,dy=b.y-a.y,d=Math.hypot(dx,dy)||.001;
@@ -220,6 +315,7 @@ function collideDummies(){
       const push=(min-d)/d*.5;
       p.x-=dx*push;p.y-=dy*push;
       q.x+=dx*push;q.y+=dy*push;
+      p.hit=q.hit=true;
     }
   }
 }
@@ -231,7 +327,8 @@ function step(){
     holdGrabs(); // last, so the held part stays right under the finger
   }
   const held=new Set([...grabs.values()].map(g=>g.d));
-  for(const d of dummies)updateStrength(d,held.has(d));
+  for(const d of dummies)updateDummy(d,held.has(d));
+  updateBlood();
 }
 
 // ---- drawing ----
@@ -243,23 +340,61 @@ function limb(a,b,w,fill){
   ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
 }
 function jointDot(p,r){ctx.fillStyle=COL.joint;ctx.beginPath();ctx.arc(p.x,p.y,r,0,Math.PI*2);ctx.fill()}
+function drawWounds(d,key){
+  for(const w of d.wounds){
+    if(w.key!==key)continue;
+    const {x,y}=woundPos(d,w);
+    ctx.fillStyle='#6e0a11';ctx.beginPath();ctx.arc(x,y,w.r,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='#b8161f';ctx.beginPath();ctx.arc(x-w.r*.15,y-w.r*.15,w.r*.55,0,Math.PI*2);ctx.fill();
+  }
+}
+// eyes look toward the side the dummy faces; closed when knocked out or dead
+function drawEyes(d){
+  const h=d.pts.head,n=d.pts.neck,r=h.r;
+  const ux=h.x-n.x,uy=h.y-n.y,ul=Math.hypot(ux,uy)||1;
+  const upx=ux/ul,upy=uy/ul,rx=-upy*d.face,ry=upx*d.face; // head's "up" and "forward"
+  const closed=d.ko||d.dead||d.blink<0;
+  ctx.strokeStyle=ctx.fillStyle='#2b3138';ctx.lineCap='round';ctx.lineWidth=Math.max(1.2,r*.12);
+  for(const off of [.08,.52]){
+    const ex=h.x+rx*off*r+upx*.12*r,ey=h.y+ry*off*r+upy*.12*r;
+    ctx.beginPath();
+    if(closed){ // a short lid line across the eye
+      ctx.moveTo(ex-rx*r*.13,ey-ry*r*.13);ctx.lineTo(ex+rx*r*.13,ey+ry*r*.13);ctx.stroke();
+    }else{
+      ctx.ellipse(ex,ey,r*.11,r*.18,Math.atan2(upy,upx)+Math.PI/2,0,Math.PI*2);ctx.fill();
+    }
+  }
+}
+function drawHealth(d){
+  if(d.hpShow<=0||d.dead)return;
+  const h=d.pts.head,w=40,x=h.x-w/2,y=h.y-h.r-14;
+  ctx.globalAlpha=Math.min(1,d.hpShow/30);
+  ctx.fillStyle='rgba(0,0,0,.45)';ctx.fillRect(x-1,y-1,w+2,6);
+  ctx.fillStyle=d.health>50?'#6cc24a':d.health>25?'#f2b544':'#e5533d';
+  ctx.fillRect(x,y,w*d.health/100,4);
+  ctx.globalAlpha=1;
+}
+// back limbs first, slightly darker, so the figure reads in depth
+const DRAW_ORDER=[
+  ['hip','kneeB',9,1],['kneeB','footB',8,1],['neck','elbowB',7.5,1],['elbowB','handB',7,1],
+  ['neck','hip',17,0],['hip','kneeF',9,0],['kneeF','footF',8,0],['head'],
+  ['neck','elbowF',7.5,0],['elbowF','handF',7,0],
+];
 function drawDummy(d){
   const P=d.pts,s=d.s;
-  // back limbs first, slightly darker, so the figure reads in depth
-  limb(P.hip,P.kneeB,9*s,COL.bodyBack);limb(P.kneeB,P.footB,8*s,COL.bodyBack);
-  limb(P.neck,P.elbowB,7.5*s,COL.bodyBack);limb(P.elbowB,P.handB,7*s,COL.bodyBack);
-  // torso
-  limb(P.neck,P.hip,17*s,COL.body);
-  // front leg
-  limb(P.hip,P.kneeF,9*s,COL.body);limb(P.kneeF,P.footF,8*s,COL.body);
-  jointDot(P.kneeF,1.6*s);
-  // head on a short neck
-  const hx=P.head.x,hy=P.head.y,hr=P.head.r;
-  ctx.fillStyle=COL.outline;ctx.beginPath();ctx.arc(hx,hy,hr+1.25,0,Math.PI*2);ctx.fill();
-  ctx.fillStyle=COL.body;ctx.beginPath();ctx.arc(hx,hy,hr,0,Math.PI*2);ctx.fill();
-  // front arm on top
-  limb(P.neck,P.elbowF,7.5*s,COL.body);limb(P.elbowF,P.handF,7*s,COL.body);
-  jointDot(P.elbowF,1.4*s);
+  for(const [a,b,w,back] of DRAW_ORDER){
+    if(a==='head'){
+      const h=P.head;
+      ctx.fillStyle=COL.outline;ctx.beginPath();ctx.arc(h.x,h.y,h.r+1.25,0,Math.PI*2);ctx.fill();
+      ctx.fillStyle=COL.body;ctx.beginPath();ctx.arc(h.x,h.y,h.r,0,Math.PI*2);ctx.fill();
+      drawWounds(d,'head');drawEyes(d);
+      continue;
+    }
+    limb(P[a],P[b],w*s,back?COL.bodyBack:COL.body);
+    drawWounds(d,a+'-'+b);
+    if(b==='footF')jointDot(P.kneeF,1.6*s);
+    if(b==='handF')jointDot(P.elbowF,1.4*s);
+  }
 }
 // glow around the body part a finger is holding
 function drawGrab(g){
@@ -281,8 +416,11 @@ function draw(){
   ctx.stroke();
   ctx.fillStyle=COL.ground;ctx.fillRect(0,groundY,VW,VH-groundY);
   ctx.fillStyle=COL.groundTop;ctx.fillRect(0,groundY,VW,3);
+  for(const sp of splats){ctx.fillStyle=sp.c;ctx.beginPath();ctx.ellipse(sp.x,groundY+1,sp.w,sp.h,0,0,Math.PI*2);ctx.fill()}
   for(const d of dummies)drawDummy(d);
+  for(const q of drops){ctx.fillStyle=q.c;ctx.beginPath();ctx.arc(q.x,q.y,q.r,0,Math.PI*2);ctx.fill()}
   for(const g of grabs.values())drawGrab(g);
+  for(const d of dummies)drawHealth(d);
 }
 
 // ---- sizing ----
@@ -303,7 +441,8 @@ const ICON={
   dummy:'<svg viewBox="0 0 30 30" stroke-linecap="round" fill="none"><g stroke="#5d6670" stroke-width="6.5"><path d="M15 9v9M15 11l-5 6M15 11l5 6M15 18l-4 8M15 18l4 8"/></g><g stroke="#dfe2e5" stroke-width="4"><path d="M15 9v9M15 11l-5 6M15 11l5 6M15 18l-4 8M15 18l4 8"/></g><circle cx="15" cy="5.5" r="3.6" fill="#dfe2e5" stroke="#5d6670" stroke-width="1.2"/></svg>',
   remove:'<svg viewBox="0 0 30 30"><path d="M12 5h6l1 2h5v2.5H6V7h5zM8 11h14l-1.2 14H9.2z" fill="#ff8a6a"/></svg>',
 };
-const TOOLS=[{id:'hand',label:'Hand'},{id:'dummy',label:'Dummy'},{id:'remove',label:'Delete'}];
+ICON.heal='<svg viewBox="0 0 30 30"><path d="M12 6h6v6h6v6h-6v6h-6v-6H6v-6h6z" fill="#6cc24a"/></svg>';
+const TOOLS=[{id:'hand',label:'Hand'},{id:'dummy',label:'Dummy'},{id:'heal',label:'Heal'},{id:'remove',label:'Delete'}];
 let tool='hand';
 const tray=document.getElementById('tray');
 for(const t of TOOLS){
@@ -354,6 +493,7 @@ cv.addEventListener('pointerdown',e=>{
   const hit=pick(x,y);
   if(!hit)return;
   if(tool==='remove'){dummies=dummies.filter(d=>d!==hit.d);for(const [id,g] of grabs)if(g.d===hit.d)grabs.delete(id);return}
+  if(tool==='heal'){heal(hit.d);hit.d.recover=0;hit.d.hpShow=90;say('Healed',1200);return}
   try{cv.setPointerCapture(e.pointerId)}catch(_){}
   grabs.set(e.pointerId,{...hit,tx:x,ty:y});
 });
@@ -379,7 +519,7 @@ slowBtn.addEventListener('click',()=>{slow=!slow;slowBtn.textContent=slow?'¼×'
 const clearBtn=document.getElementById('clearBtn');let armed=0;
 function showClear(){clearBtn.innerHTML=armed?'Tap to clear':ICON_TRASH;clearBtn.classList.toggle('warn',!!armed)}
 clearBtn.addEventListener('click',()=>{
-  if(armed){clearTimeout(armed);armed=0;dummies=[];grabs.clear()}
+  if(armed){clearTimeout(armed);armed=0;dummies=[];drops=[];splats=[];grabs.clear()}
   else armed=setTimeout(()=>{armed=0;showClear()},2500);
   showClear();
 });showClear();
@@ -402,7 +542,7 @@ function frame(now){
 fit();
 new ResizeObserver(fit).observe(stage);
 makeDummy(VW*.5,groundY-(SKELETON.footF[1]+RADIUS.footF)*scale()); // standing on the ground
-window.__yard={dummies:()=>dummies,groundY:()=>groundY,pick}; // for testing from the console
+window.__yard={dummies:()=>dummies,groundY:()=>groundY,pick,blood:()=>({drops:drops.length,splats:splats.length})}; // for testing from the console
 requestAnimationFrame(frame);
 
 // cache the game on the device so it opens with no connection

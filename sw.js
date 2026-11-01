@@ -1,5 +1,5 @@
 // Bump VERSION whenever any game file changes so devices pick up the new copy.
-const VERSION = 'pocket-grains-v1';
+const VERSION = 'pocket-grains-v2';
 const FILES = [
   './',
   './index.html',
@@ -10,7 +10,7 @@ const FILES = [
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES.map((f) => new Request(f, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (e) => {

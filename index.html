@@ -56,6 +56,11 @@ body{
 .dot{display:inline-block;border-radius:50%;background:currentColor}
 .stage{flex:1;min-height:0;position:relative;display:flex;align-items:flex-end;justify-content:center;background:#08090a}
 canvas{display:block;touch-action:none;image-rendering:pixelated;image-rendering:crisp-edges;background:#0b0e10}
+.toast{
+  position:absolute;bottom:12px;left:50%;transform:translateX(-50%);max-width:calc(100% - 32px);
+  font:600 13px/1.3 var(--font-body);text-align:center;
+  background:var(--panel);color:var(--fg);border:1px solid var(--line);padding:8px 12px;border-radius:8px;pointer-events:none;
+}
 .paused{
   position:absolute;top:10px;left:50%;transform:translateX(-50%);
   font:700 11px/1 var(--font-display);letter-spacing:.12em;text-transform:uppercase;
@@ -94,6 +99,7 @@ canvas{display:block;touch-action:none;image-rendering:pixelated;image-rendering
   <div class="stage" id="stage">
     <canvas id="cv"></canvas>
     <div class="paused" id="pausedTag" hidden>Paused</div>
+    <div class="toast" id="toast" role="status" hidden></div>
   </div>
   <div class="tray" id="tray" role="toolbar" aria-label="Elements"></div>
 </div>
@@ -492,7 +498,19 @@ function start(data){
 }
 start({});
 // cache the game on the device so it opens with no connection
-if('serviceWorker' in navigator)addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));
+const toast=document.getElementById('toast');
+function say(msg,ms){toast.textContent=msg;toast.hidden=false;clearTimeout(say.t);say.t=setTimeout(()=>{toast.hidden=true},ms)}
+if('serviceWorker' in navigator){
+  addEventListener('load',async()=>{
+    try{
+      await navigator.serviceWorker.register('sw.js');
+      await navigator.serviceWorker.ready;
+      const saved=await caches.match('./index.html');
+      if(saved)say('✓ Ready to play offline',3500);
+      else say('Not saved for offline yet. Open it once with internet.',7000);
+    }catch(e){say('Not saved for offline yet. Open it once with internet.',7000)}
+  });
+}else say('This browser can’t save the game for offline play',7000);
 })();
 </script>
 </body>

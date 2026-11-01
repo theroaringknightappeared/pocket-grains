@@ -64,7 +64,8 @@ body{
 .chip svg{width:30px;height:30px}
 .chip[aria-pressed="true"]{border-color:var(--accent);color:var(--fg);background:#232931}
 .stage{flex:1;min-height:0;position:relative}
-canvas{position:absolute;inset:0;display:block;touch-action:none}
+/* explicit size: on 2x screens a canvas otherwise shows at its pixel size and spills off screen */
+canvas{position:absolute;left:0;top:0;width:100%;height:100%;display:block;touch-action:none}
 .tag,.toast{position:absolute;left:50%;transform:translateX(-50%);pointer-events:none}
 .tag{
   top:10px;font:800 11px/1 var(--font-display);letter-spacing:.12em;text-transform:uppercase;
@@ -581,6 +582,7 @@ function fit(){
   const ow=VW,oh=VH;
   VW=r.width;VH=r.height;dpr=Math.min(2,devicePixelRatio||1);
   cv.width=Math.round(VW*dpr);cv.height=Math.round(VH*dpr);
+  cv.style.width=VW+'px';cv.style.height=VH+'px';
   groundY=VH-GROUND_H;
   // keep dummies standing on the ground when the screen rotates
   if(oh&&oh!==VH){const dy=(VH-oh);for(const d of dummies)for(const p of d.list){p.y+=dy;p.py+=dy}}

@@ -1,13 +1,13 @@
 {
-  "name": "Pocket Grains",
-  "short_name": "Grains",
-  "description": "A falling-sand sandbox that plays offline.",
+  "name": "Dummy Yard",
+  "short_name": "Dummy Yard",
+  "description": "A ragdoll physics sandbox that plays offline.",
   "start_url": "./",
   "scope": "./",
   "display": "fullscreen",
   "orientation": "any",
-  "background_color": "#0c0f11",
-  "theme_color": "#151a1d",
+  "background_color": "#1b2026",
+  "theme_color": "#1b2026",
   "icons": [
     { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
     { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }

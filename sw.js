@@ -1,5 +1,5 @@
 // Bump VERSION whenever any game file changes so devices pick up the new copy.
-const VERSION = 'pocket-grains-v9';
+const VERSION = 'pocket-grains-v10';
 const FILES = [
   './',
   './index.html',

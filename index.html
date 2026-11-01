@@ -296,7 +296,13 @@ function hurtAt(d,c,dmg){
   const sh=c.sh,f=spotFrame(d,sh,c.t,c.nx,c.ny),cut=dmg>=CUT;
   // the same spot hit again gets worse instead of a new mark appearing next to it
   let sp=d.spots.find(o=>o.key===sh.key&&(sh.key==='head'?angDiff(o.ang,f.ang)<.5:Math.abs(o.t-f.t)<.14&&Math.abs(o.side-f.side)<.8));
-  if(!sp){sp={key:sh.key,...f,bruise:0,cut:0,bleed:0,age:0};d.spots.push(sp);if(d.spots.length>40)d.spots.shift()}
+  if(!sp){
+    // each mark gets its own uneven shape: a few overlapping blotches, and a ragged line for a cut
+    const blobs=Array.from({length:4},()=>({u:rnd(-.45,.45),v:rnd(-.3,.3),r:rnd(.45,.8)}));
+    const jag=Array.from({length:6},()=>rnd(-.35,.35));
+    sp={key:sh.key,...f,bruise:0,cut:0,bleed:0,age:0,trail:0,blobs,jag,tilt:rnd(-.35,.35)};
+    d.spots.push(sp);if(d.spots.length>40)d.spots.shift();
+  }
   sp.bruise=Math.min(1.5,sp.bruise+dmg/28);sp.age=Math.min(sp.age,30);
   const {x,y}=contactPoint(d,c);
   if(cut){
@@ -340,13 +346,17 @@ function updateDummy(d,grabbed){
     // bounces right after a hit only add what goes beyond it, so one throw can't stack up a kill
     const extra=d.hurtCool>0?bestDmg-d.lastDmg:bestDmg;
     if(extra>2){hurtAt(d,best,extra);d.lastDmg=d.hurtCool>0?Math.max(d.lastDmg,bestDmg):bestDmg}
-    d.hurtCool=12;
+    d.hurtCool=30; // about half a second: a whole crash counts as one event
   }else if(loudest>7)thud(Math.min(.22,(loudest-7)*.03),false); // harmless bump
   // cuts drip and drain health until they clot
   let bleed=0;
   for(const sp of d.spots){
     sp.age++;
-    if(sp.bleed>.01){bleed+=sp.bleed;if(Math.random()<sp.bleed*.25)drip(d,sp);sp.bleed*=d.dead?.996:.998}
+    if(sp.bleed>.01){
+      bleed+=sp.bleed;if(Math.random()<sp.bleed*.25)drip(d,sp);
+      sp.trail=Math.min(1,sp.trail+sp.bleed*.004); // blood runs down the skin from the cut
+      sp.bleed*=d.dead?.996:.998;
+    }
   }
   if(bleed&&!d.dead){d.health-=bleed*.012;if(d.health<=0)die(d)}
   if(d.hpShow>0)d.hpShow--;
@@ -425,16 +435,53 @@ function integrate(p){
   p.px=p.x;p.py=p.y;
   p.x+=vx;p.y+=vy+GRAVITY;
 }
-// floor and walls; remembers how fast each joint hit them
+// floor and walls: push joints back out and remember how fast they hit.
+// This runs every solver pass, so it only moves positions; friction is applied once per step.
 function bounds(p){
   if(p.y>groundY-p.r){
     p.hitSpeed=Math.max(p.hitSpeed,p.y-p.py,.001);p.nx=0;p.ny=1;
-    p.y=groundY-p.r;
-    p.px=p.x-(p.x-p.px)*.75; // ground friction
-    if(p.py<p.y)p.py=p.y;     // no bounce
+    p.y=groundY-p.r;p.onGround=true;
   }
-  if(p.x<p.r){p.hitSpeed=Math.max(p.hitSpeed,p.px-p.x,.001);p.nx=-1;p.ny=0;p.x=p.r;p.px=p.x+(p.x-p.px)*-.3}
-  if(p.x>VW-p.r){p.hitSpeed=Math.max(p.hitSpeed,p.x-p.px,.001);p.nx=1;p.ny=0;p.x=VW-p.r;p.px=p.x+(p.x-p.px)*-.3}
+  if(p.x<p.r){
+    const vx=p.x-p.px;p.hitSpeed=Math.max(p.hitSpeed,-vx,.001);p.nx=-1;p.ny=0;
+    p.x=p.r;if(vx<0)p.px=p.x+vx*.3; // bounce back a little
+  }
+  if(p.x>VW-p.r){
+    const vx=p.x-p.px;p.hitSpeed=Math.max(p.hitSpeed,vx,.001);p.nx=1;p.ny=0;
+    p.x=VW-p.r;if(vx>0)p.px=p.x+vx*.3;
+  }
+}
+// once per step: parts resting on the floor slide to a stop instead of skating, and don't bounce
+function groundFriction(d){
+  for(const p of d.list){
+    if(!p.onGround)continue;
+    p.onGround=false;
+    p.px=p.x-(p.x-p.px)*.82;
+    if(p.py<p.y)p.py=p.y;
+  }
+}
+// Knees and elbows only bend one way, and the head only tilts so far on the neck.
+// [parent, joint, child, smallest and largest bend in radians, measured toward the face]
+const HINGES=[
+  ['hip','kneeB','footB',-.25,2.5],['hip','kneeF','footF',-.25,2.5],
+  ['neck','elbowB','handB',-2.6,.3],['neck','elbowF','handF',-2.6,.3],
+  ['hip','neck','head',-.6,.6],
+];
+function rotateAround(p,c,a){
+  const cs=Math.cos(a),sn=Math.sin(a),dx=p.x-c.x,dy=p.y-c.y;
+  p.x=c.x+dx*cs-dy*sn;p.y=c.y+dx*sn+dy*cs;
+}
+function solveHinges(d){
+  const P=d.pts;
+  for(const [ka,kj,kc,lo,hi] of HINGES){
+    const a=P[ka],j=P[kj],c=P[kc];
+    const ux=j.x-a.x,uy=j.y-a.y,vx=c.x-j.x,vy=c.y-j.y; // along the upper part, then the lower part
+    const bend=Math.atan2(ux*vy-uy*vx,ux*vx+uy*vy)*d.face;
+    const over=bend<lo?bend-lo:bend>hi?bend-hi:0;
+    if(!over)continue;
+    // swing both parts back toward the limit, half each
+    rotateAround(c,j,-over*d.face*.5);rotateAround(a,j,over*d.face*.5);
+  }
 }
 function solveStick(st){
   const a=st.a,b=st.b,dx=b.x-a.x,dy=b.y-a.y,d=Math.hypot(dx,dy)||.001;
@@ -447,18 +494,26 @@ function solveStick(st){
 function holdGrabs(){
   for(const g of grabs.values()){
     const {a,b,t}=g;
-    shove(a,b,t,g.tx-(a.x+(b.x-a.x)*t),g.ty-(a.y+(b.y-a.y)*t));
+    shove(a,b,t,g.sx-(a.x+(b.x-a.x)*t),g.sy-(a.y+(b.y-a.y)*t));
+  }
+}
+// the held spot glides after the finger instead of snapping to every touch event
+function easeGrabs(){
+  for(const g of grabs.values()){
+    if(g.sx===undefined){g.sx=g.tx;g.sy=g.ty}
+    g.sx+=(g.tx-g.sx)*.55;g.sy+=(g.ty-g.sy)*.55;
   }
 }
 function step(){
+  easeGrabs();
   for(const d of dummies){for(const p of d.list)integrate(p);balance(d)}
   for(let k=0;k<ITER;k++){
-    for(const d of dummies){for(const st of d.sticks)solveStick(st);for(const p of d.list)bounds(p)}
+    for(const d of dummies){for(const st of d.sticks)solveStick(st);solveHinges(d);for(const p of d.list)bounds(p)}
     if(k%3===0)collideDummies();
     holdGrabs(); // last, so the held part stays right under the finger
   }
   const held=new Set([...grabs.values()].map(g=>g.d));
-  for(const d of dummies){surfaceContacts(d);updateDummy(d,held.has(d))}
+  for(const d of dummies){groundFriction(d);surfaceContacts(d);updateDummy(d,held.has(d))}
   updateBlood();
 }
 
@@ -486,21 +541,38 @@ function drawSpots(d,sh,A,B,half){
   ctx.save();partPath(A,B,half);ctx.clip();
   for(const sp of list){
     const {x,y,ang}=spotPos(d,sp),base=sh.key==='head'?A.r*.55:half;
-    if(sp.bruise>0){ // fresh red, darkening to purple over a few seconds
-      const k=Math.min(1,sp.age/240),r=165-70*k|0,g=55-5*k|0,b=75+45*k|0;
-      const R=base*(.55+.4*Math.min(1.2,sp.bruise)),a=.3+.35*Math.min(1,sp.bruise);
-      const gr=ctx.createRadialGradient(x,y,0,x,y,R);
-      gr.addColorStop(0,`rgba(${r},${g},${b},${a})`);gr.addColorStop(.6,`rgba(${r},${g},${b},${a*.6})`);gr.addColorStop(1,`rgba(${r},${g},${b},0)`);
-      ctx.fillStyle=gr;ctx.beginPath();ctx.arc(x,y,R,0,Math.PI*2);ctx.fill();
+    const cutL=base*(.45+.5*Math.min(1,sp.cut)),cutW=Math.max(.8,base*(.09+.09*Math.min(1,sp.cut)));
+    if(sp.trail>0){ // blood that ran down the skin from the cut: bright while it flows, darker once it stops
+      const len=base*4.5*sp.trail,w=cutW*1.3;
+      ctx.strokeStyle=sp.bleed>.05?'rgba(150,16,26,.85)':'rgba(105,14,22,.8)';ctx.lineCap='round';
+      for(const [dx,f] of [[-cutL*.3,1],[cutL*.25,.6]]){
+        const sx=x+Math.cos(ang)*dx,sy=y+Math.sin(ang)*dx;
+        ctx.lineWidth=w*f;ctx.beginPath();ctx.moveTo(sx,sy);
+        ctx.quadraticCurveTo(sx+w*sp.tilt*3,sy+len*f*.5,sx+w*sp.tilt*1.5,sy+len*f);ctx.stroke();
+        ctx.fillStyle=ctx.strokeStyle;ctx.beginPath();ctx.arc(sx+w*sp.tilt*1.5,sy+len*f,w*f*.75,0,Math.PI*2);ctx.fill(); // drop at the tip
+      }
     }
-    if(sp.cut>0){ // a gash running along the skin, wet while it still bleeds
-      const L=base*(.4+.45*Math.min(1,sp.cut)),W=Math.max(1,base*(.12+.12*Math.min(1,sp.cut)));
-      ctx.save();ctx.translate(x,y);ctx.rotate(ang);
-      ctx.fillStyle='#5c0910';ctx.beginPath();ctx.ellipse(0,0,L,W*1.5,0,0,Math.PI*2);ctx.fill();
-      ctx.fillStyle='#b3141e';ctx.beginPath();ctx.ellipse(0,0,L*.8,W*.8,0,0,Math.PI*2);ctx.fill();
-      if(sp.bleed>.05){ctx.fillStyle='rgba(255,140,140,.45)';ctx.beginPath();ctx.ellipse(-L*.25,-W*.3,L*.25,W*.3,0,0,Math.PI*2);ctx.fill()}
-      ctx.restore();
+    ctx.save();ctx.translate(x,y);ctx.rotate(ang+sp.tilt);
+    if(sp.bruise>0){ // blotchy: reddish when fresh, purple after a few seconds, bluer later
+      const k=Math.min(1,sp.age/300),k2=Math.min(1,Math.max(0,(sp.age-300)/1500));
+      const r=185-80*k-25*k2|0,g=70-10*k+10*k2|0,b=95+35*k+5*k2|0;
+      const R=base*(.5+.38*Math.min(1.2,sp.bruise)),a=.2+.22*Math.min(1,sp.bruise);
+      for(const bl of sp.blobs){
+        const bx=bl.u*R,by=bl.v*R,br=R*bl.r;
+        const gr=ctx.createRadialGradient(bx,by,0,bx,by,br);
+        gr.addColorStop(0,`rgba(${r},${g},${b},${a})`);gr.addColorStop(1,`rgba(${r},${g},${b},0)`);
+        ctx.fillStyle=gr;ctx.beginPath();ctx.arc(bx,by,br,0,Math.PI*2);ctx.fill();
+      }
     }
+    if(sp.cut>0){ // a ragged split in the skin, wet-looking while it bleeds
+      const J=sp.jag,n=J.length;
+      const path=()=>{ctx.beginPath();for(let i=0;i<n;i++){const u=-cutL+2*cutL*i/(n-1);i?ctx.lineTo(u,J[i]*cutW*2):ctx.moveTo(u,J[i]*cutW*2)}};
+      ctx.lineCap=ctx.lineJoin='round';
+      ctx.strokeStyle='rgba(120,20,35,.35)';ctx.lineWidth=cutW*4.5;path();ctx.stroke(); // swollen edge
+      ctx.strokeStyle='#4a070c';ctx.lineWidth=cutW*2.2;path();ctx.stroke();
+      ctx.strokeStyle=sp.bleed>.05?'#c0161f':'#7d0d14';ctx.lineWidth=cutW;path();ctx.stroke();
+    }
+    ctx.restore();
   }
   ctx.restore();
 }
@@ -685,15 +757,32 @@ const toast=document.getElementById('toast');
 function say(msg,ms){toast.textContent=msg;toast.hidden=false;clearTimeout(say.t);say.t=setTimeout(()=>{toast.hidden=true},ms)}
 
 // ---- loop: fixed 60 steps a second ----
-let last=performance.now(),acc=0,slowTick=0;
+// Physics runs 60 times a second. Screens refresh at 60 or 120, so every frame shows a
+// blend between the last two physics steps instead of jumping from one to the next.
+const STEP=1000/60;
+let last=performance.now(),acc=0;
 function frame(now){
   acc+=Math.min(100,now-last);last=now;
-  while(acc>=1000/60){
-    acc-=1000/60;
-    if(!paused&&(!slow||(slowTick++%4===0)))step()
+  const every=slow?STEP*4:STEP; // slow motion: same steps, spread over more frames
+  if(paused)acc=0;
+  while(acc>=every){
+    acc-=every;
+    for(const d of dummies)for(const p of d.list){p.ox=p.x;p.oy=p.y}
+    for(const q of drops){q.ox=q.x;q.oy=q.y}
+    step();
   }
-  draw();
+  drawBlended(paused?1:acc/every);
   requestAnimationFrame(frame);
+}
+// draw everything at its in-between position, then put the physics positions back
+function drawBlended(t){
+  const moved=[];
+  const blend=p=>{if(p.ox===undefined)return;moved.push(p,p.x,p.y);p.x=p.ox+(p.x-p.ox)*t;p.y=p.oy+(p.y-p.oy)*t};
+  for(const d of dummies)for(const p of d.list)blend(p);
+  for(const q of drops)blend(q);
+  window.__yard?.onDraw?.();
+  draw();
+  for(let i=0;i<moved.length;i+=3){moved[i].x=moved[i+1];moved[i].y=moved[i+2]}
 }
 fit();
 new ResizeObserver(fit).observe(stage);

@@ -81,6 +81,7 @@ canvas{position:absolute;inset:0;display:block;touch-action:none}
 <div class="app">
   <div class="bar">
     <div class="name">Dummy <b>Yard</b></div>
+    <button class="btn" id="soundBtn" aria-label="Sound"></button>
     <button class="btn" id="slowBtn" aria-label="Slow motion">1×</button>
     <button class="btn" id="pauseBtn" aria-label="Pause"></button>
     <button class="btn" id="clearBtn" aria-label="Clear the yard"></button>
@@ -118,7 +119,22 @@ const SKELETON={
   elbowB:[3,-24],handB:[4,-8],elbowF:[-3,-24],handF:[-4,-8],
   kneeB:[4,22],footB:[5,44],kneeF:[-4,22],footF:[-5,44],
 };
-const RADIUS={head:10,neck:5,hip:6,elbowB:4,handB:4,elbowF:4,handF:4,kneeB:5,footB:4.5,kneeF:5,footF:4.5};
+// The body as capsules, drawn back to front. The physics collides with exactly these
+// shapes, so a hit lands where you see it. tough: how much a hit on that part hurts.
+const SHAPES=[
+  {a:'hip',b:'kneeB',w:8.5,back:1,tough:.8},{a:'kneeB',b:'footB',w:8.5,back:1,tough:.5},
+  {a:'neck',b:'elbowB',w:7,back:1,tough:.8},{a:'elbowB',b:'handB',w:7,back:1,tough:.6},
+  {a:'neck',b:'hip',w:17,tough:1},
+  {a:'hip',b:'kneeF',w:8.5,tough:.8},{a:'kneeF',b:'footF',w:8.5,tough:.5},
+  {a:'head',b:'head',w:20,tough:1.4},
+  {a:'neck',b:'elbowF',w:7,tough:.8},{a:'elbowF',b:'handF',w:7,tough:.6},
+];
+for(const sh of SHAPES)sh.key=sh.a===sh.b?'head':sh.a+'-'+sh.b;
+const SHAPE_BY_KEY=Object.fromEntries(SHAPES.map(sh=>[sh.key,sh]));
+const PARTS=SHAPES.map(sh=>[sh.a,sh.b,sh.w]); // for picking with a finger, front-most last
+// each joint is as round as the thickest part that meets there
+const RADIUS={};
+for(const sh of SHAPES)for(const k of [sh.a,sh.b])RADIUS[k]=Math.max(RADIUS[k]||0,sh.w/2);
 const BONES=[ // [from,to] rigid
   ['head','neck'],['neck','hip'],
   ['neck','elbowB'],['elbowB','handB'],['neck','elbowF'],['elbowF','handF'],
@@ -131,23 +147,23 @@ function makeDummy(x,y){
   const s=scale(),pts={};
   for(const k in SKELETON){
     const [ux,uy]=SKELETON[k];
-    pts[k]={x:x+ux*s,y:y+uy*s,px:x+ux*s,py:y+uy*s,r:RADIUS[k]*s};
+    pts[k]={x:x+ux*s,y:y+uy*s,px:x+ux*s,py:y+uy*s,r:RADIUS[k]*s,key:k,vx:0,vy:0,hitSpeed:0,nx:0,ny:1};
   }
   const sticks=[];
   const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
   for(const [a,b] of BONES)sticks.push({a:pts[a],b:pts[b],len:dist(pts[a],pts[b]),type:'fixed'});
   for(const [a,b,type,f] of BRACES)sticks.push({a:pts[a],b:pts[b],len:dist(pts[a],pts[b])*(f||1),type,stiff:type==='fixed'?.5:1});
-  for(const [k,p] of Object.entries(pts)){p.vx=0;p.vy=0;p.hit=false;p.key=k}
-  const d={pts,list:Object.values(pts),sticks,s,strength:1,recover:0,
+  const d={pts,list:Object.values(pts),sticks,s,strength:1,recover:0,contacts:{},
     face:Math.random()<.5?-1:1,blink:rnd(60,240)};
   heal(d);
   dummies.push(d);
   return d;
 }
 const rnd=(a,b)=>a+Math.random()*(b-a);
-// back to full health: no wounds, no bleeding, nothing broken
+const clamp01=v=>v<0?0:v>1?1:v;
+// back to full health: no injuries, nothing broken
 function heal(d){
-  Object.assign(d,{health:100,dead:false,ko:false,bleed:0,wounds:[],partDmg:{},legBroken:false,armBroken:{B:false,F:false},hpShow:0,hurtCool:0,lastHit:0,lastDmg:0});
+  Object.assign(d,{health:100,dead:false,ko:false,spots:[],partDmg:{},legBroken:false,armBroken:{B:false,F:false},hpShow:0,hurtCool:0,lastDmg:0});
 }
 
 // ---- balance: muscles ease each joint toward its standing pose, measured from the hip ----
@@ -171,91 +187,167 @@ function balance(d){
   }
 }
 
-// ---- damage: parts that slam into the ground, walls or another dummy get hurt ----
-const IMPACT=14;  // speed lost (px/step) before a hit hurts; small drops and bumps are harmless
-const CUT=16;     // damage at which a hit breaks the skin instead of just bruising
-// how much a hit on each joint hurts: swinging hands and landing feet shrug off more, the head less
-const TOUGH={head:1.4,neck:1,hip:1,elbowB:.8,elbowF:.8,kneeB:.8,kneeF:.8,handB:.5,handF:.5,footB:.4,footF:.4};
+// ---- contacts: which body part touched what, where along it, from which side, how fast ----
+// (nx,ny) points from the body part toward what it hit; speed is how fast they closed in (px/step)
+function addContact(d,sh,t,nx,ny,speed){
+  const o=d.contacts[sh.key];
+  if(!o||speed>o.speed)d.contacts[sh.key]={sh,t,nx,ny,speed};
+}
+// floor and wall hits are caught at the joints; hand each to the part whose skin actually touched
+function surfaceContacts(d){
+  const P=d.pts;
+  for(const sh of SHAPES){
+    const A=P[sh.a],B=P[sh.b],r=sh.w*d.s/2;
+    if(A===B){if(A.hitSpeed)addContact(d,sh,0,A.nx,A.ny,A.hitSpeed);continue}
+    // a thinner part meeting a thicker one at a joint isn't the one touching there
+    const ha=A.hitSpeed&&A.r<=r+.01,hb=B.hitSpeed&&B.r<=r+.01;
+    if(ha&&hb){ // lying flat along the surface: the hit centres toward the faster end
+      const sa=A.hitSpeed,sb=B.hitSpeed;
+      addContact(d,sh,clamp01(.5+(sb-sa)/(sa+sb)*.5),A.nx,A.ny,Math.max(sa,sb));
+    }else if(ha)addContact(d,sh,.08,A.nx,A.ny,A.hitSpeed);
+    else if(hb)addContact(d,sh,.92,B.nx,B.ny,B.hitSpeed);
+  }
+  for(const p of d.list)p.hitSpeed=0;
+}
+// closest points between two segments, as fractions along each (Ericson, Real-Time Collision Detection 5.1.9)
+function closestSegSeg(p1,q1,p2,q2){
+  const d1x=q1.x-p1.x,d1y=q1.y-p1.y,d2x=q2.x-p2.x,d2y=q2.y-p2.y,rx=p1.x-p2.x,ry=p1.y-p2.y;
+  const a=d1x*d1x+d1y*d1y,e=d2x*d2x+d2y*d2y,f=d2x*rx+d2y*ry;
+  if(a<1e-6&&e<1e-6)return [0,0];
+  if(a<1e-6)return [0,clamp01(f/e)];
+  const c=d1x*rx+d1y*ry;
+  if(e<1e-6)return [clamp01(-c/a),0];
+  const b=d1x*d2x+d1y*d2y,den=a*e-b*b;
+  let s=den>1e-6?clamp01((b*f-c*e)/den):0,t=(b*s+f)/e;
+  if(t<0){t=0;s=clamp01(-c/a)}else if(t>1){t=1;s=clamp01((b-c)/a)}
+  return [s,t];
+}
+// move a capsule's two ends so the spot at fraction s along it moves by (dx,dy)
+function shove(A,B,s,dx,dy){
+  if(A===B){A.x+=dx;A.y+=dy;return}
+  const wa=1-s,wb=s,den=wa*wa+wb*wb;
+  A.x+=dx*wa/den;A.y+=dy*wa/den;B.x+=dx*wb/den;B.y+=dy*wb/den;
+}
+// dummies collide body part against body part, so a shin can hit a belly mid-limb
+function collideDummies(){
+  for(let i=0;i<dummies.length;i++)for(let j=i+1;j<dummies.length;j++){
+    const di=dummies[i],dj=dummies[j];
+    if(!boxesTouch(di,dj))continue;
+    for(const s1 of SHAPES){
+      const A1=di.pts[s1.a],B1=di.pts[s1.b],r1=s1.w*di.s/2;
+      for(const s2 of SHAPES){
+        const A2=dj.pts[s2.a],B2=dj.pts[s2.b],r2=s2.w*dj.s/2;
+        const [s,t]=closestSegSeg(A1,B1,A2,B2);
+        const c1x=A1.x+(B1.x-A1.x)*s,c1y=A1.y+(B1.y-A1.y)*s,c2x=A2.x+(B2.x-A2.x)*t,c2y=A2.y+(B2.y-A2.y)*t;
+        let dx=c2x-c1x,dy=c2y-c1y,dist=Math.hypot(dx,dy);
+        const min=r1+r2;
+        if(dist>=min)continue;
+        let nx=0,ny=-1;if(dist>1e-6){nx=dx/dist;ny=dy/dist}
+        const pen=(min-dist)/2;
+        // how fast the two spots were closing in along the line between them
+        const v1x=(A1.x-A1.px)*(1-s)+(B1.x-B1.px)*s,v1y=(A1.y-A1.py)*(1-s)+(B1.y-B1.py)*s;
+        const v2x=(A2.x-A2.px)*(1-t)+(B2.x-B2.px)*t,v2y=(A2.y-A2.py)*(1-t)+(B2.y-B2.py)*t;
+        const closing=(v1x-v2x)*nx+(v1y-v2y)*ny;
+        shove(A1,B1,s,-nx*pen,-ny*pen);shove(A2,B2,t,nx*pen,ny*pen);
+        if(closing>0){addContact(di,s1,s,nx,ny,closing);addContact(dj,s2,t,-nx,-ny,closing)}
+      }
+    }
+  }
+}
+function boxesTouch(a,b){
+  let ax0=1e9,ax1=-1e9,ay0=1e9,ay1=-1e9,bx0=1e9,bx1=-1e9,by0=1e9,by1=-1e9;
+  for(const p of a.list){ax0=Math.min(ax0,p.x-p.r);ax1=Math.max(ax1,p.x+p.r);ay0=Math.min(ay0,p.y-p.r);ay1=Math.max(ay1,p.y+p.r)}
+  for(const p of b.list){bx0=Math.min(bx0,p.x-p.r);bx1=Math.max(bx1,p.x+p.r);by0=Math.min(by0,p.y-p.r);by1=Math.max(by1,p.y+p.r)}
+  return ax0<bx1&&bx0<ax1&&ay0<by1&&by0<ay1;
+}
+
+// ---- damage ----
+const IMPACT=14;  // closing speed (px/step) before a hit hurts; small drops and bumps are harmless
+const CUT=16;     // damage at which the skin splits as well as bruising
 const KO_HIT=22;  // damage that knocks a dummy out cold (head hits need less)
 // falls over but stays awake; gets up when recover runs out
 function loseBalance(d,frames){d.strength=0;d.recover=Math.max(d.recover,frames)}
 function knockOut(d,frames){loseBalance(d,frames);d.ko=true}
-// p hit something; (nx,ny) points from p toward what it hit
-function hurt(d,p,nx,ny,dmg){
-  const head=p.key==='head';
-  const cx=p.x+nx*p.r,cy=p.y+ny*p.r; // where the hit landed, on the skin
-  const cut=dmg>=CUT;
-  addWound(d,p,cx,cy,dmg,cut);
-  if(cut){spray(cx,cy,nx,ny,dmg,d.s);d.bleed=Math.min(2,d.bleed+dmg*.012)}
+function die(d){d.health=0;d.dead=true;d.strength=0;d.ko=true}
+const angDiff=(a,b)=>Math.abs(Math.atan2(Math.sin(a-b),Math.cos(a-b)));
+// the exact spot on the skin that took the hit
+function contactPoint(d,c){
+  const sh=c.sh,A=d.pts[sh.a],B=d.pts[sh.b],r=sh.key==='head'?A.r:sh.w*d.s/2;
+  return {x:A.x+(B.x-A.x)*c.t+c.nx*r,y:A.y+(B.y-A.y)*c.t+c.ny*r};
+}
+// injuries are kept in the body part's own frame (along it, and which side) so they move with it
+function spotFrame(d,sh,t,nx,ny){
+  if(sh.key==='head'){const h=d.pts.head,n=d.pts.neck;return {ang:Math.atan2(ny,nx)-Math.atan2(h.y-n.y,h.x-n.x)}}
+  const A=d.pts[sh.a],B=d.pts[sh.b],dx=B.x-A.x,dy=B.y-A.y,len=Math.hypot(dx,dy)||1;
+  return {t:Math.min(.94,Math.max(.06,t)),side:(nx*-dy+ny*dx)/len}; // side: -1..1 across the limb
+}
+function spotPos(d,sp){
+  if(sp.key==='head'){
+    const h=d.pts.head,n=d.pts.neck,a=Math.atan2(h.y-n.y,h.x-n.x)+sp.ang;
+    return {x:h.x+Math.cos(a)*h.r*.62,y:h.y+Math.sin(a)*h.r*.62,ang:a+Math.PI/2};
+  }
+  const sh=SHAPE_BY_KEY[sp.key],A=d.pts[sh.a],B=d.pts[sh.b],dx=B.x-A.x,dy=B.y-A.y,len=Math.hypot(dx,dy)||1;
+  const off=sp.side*sh.w*d.s/2*.55;
+  return {x:A.x+dx*sp.t-dy/len*off,y:A.y+dy*sp.t+dx/len*off,ang:Math.atan2(dy,dx)};
+}
+// every hit bruises where it lands; hard ones split the skin there too, and that cut bleeds
+function hurtAt(d,c,dmg){
+  const sh=c.sh,f=spotFrame(d,sh,c.t,c.nx,c.ny),cut=dmg>=CUT;
+  // the same spot hit again gets worse instead of a new mark appearing next to it
+  let sp=d.spots.find(o=>o.key===sh.key&&(sh.key==='head'?angDiff(o.ang,f.ang)<.5:Math.abs(o.t-f.t)<.14&&Math.abs(o.side-f.side)<.8));
+  if(!sp){sp={key:sh.key,...f,bruise:0,cut:0,bleed:0,age:0};d.spots.push(sp);if(d.spots.length>40)d.spots.shift()}
+  sp.bruise=Math.min(1.5,sp.bruise+dmg/28);sp.age=Math.min(sp.age,30);
+  const {x,y}=contactPoint(d,c);
+  if(cut){
+    sp.cut=Math.min(1.2,sp.cut+dmg/40);sp.bleed=Math.min(1,sp.bleed+dmg*.012);
+    spray(x,y,c.nx,c.ny,dmg,d.s);
+  }
+  thud(Math.min(.9,.2+dmg/40),cut);
+  if(dmg>=KO_HIT)shake=Math.max(shake,Math.min(9,dmg*.25));
+  if(sh.key!=='head'){
+    d.partDmg[sh.key]=(d.partDmg[sh.key]||0)+dmg;
+    if(d.partDmg[sh.key]>45){
+      if(/knee|foot/.test(sh.key))d.legBroken=true;
+      if(/elbowB|handB/.test(sh.key))d.armBroken.B=true;
+      if(/elbowF|handF/.test(sh.key))d.armBroken.F=true;
+    }
+  }
   if(d.dead)return;
   d.health-=dmg;d.hpShow=150;
-  if(dmg>=KO_HIT||head&&dmg>=15)knockOut(d,Math.min(420,90+dmg*5));
+  if(dmg>=KO_HIT||sh.key==='head'&&dmg>=15)knockOut(d,Math.min(420,90+dmg*5));
   else if(dmg>=6)loseBalance(d,50);
   if(d.health<=0)die(d);
 }
-function die(d){d.health=0;d.dead=true;d.strength=0;d.ko=true}
-// a wound sits on the skin of the body part nearest the spot that was hit, and moves with it
-function addWound(d,p,cx,cy,dmg,cut){
-  const s=d.s,size=(cut?1.6+dmg*.07:2.5+dmg*.12)*s;
-  let w;
-  if(p.key==='head'){
-    const n=d.pts.neck,up=Math.atan2(p.y-n.y,p.x-n.x);
-    w={key:'head',ang:Math.atan2(cy-p.y,cx-p.x)-up,r:Math.min(p.r*(cut?.32:.45),size)};
-  }else{
-    let best=null,bd=Infinity;
-    for(const [a,b,width] of PARTS){
-      if(a===b||a!==p.key&&b!==p.key)continue;
-      const A=d.pts[a],B=d.pts[b],dx=B.x-A.x,dy=B.y-A.y,len2=dx*dx+dy*dy||1;
-      const t=Math.max(0,Math.min(1,((cx-A.x)*dx+(cy-A.y)*dy)/len2));
-      const side=((cx-A.x)*-dy+(cy-A.y)*dx)/Math.sqrt(len2); // signed distance across the limb
-      const gap=Math.abs(Math.hypot(cx-A.x-dx*t,cy-A.y-dy*t)-width*s/2);
-      if(gap<bd){bd=gap;best={a,b,t,side,half:width*s/2}}
-    }
-    const {a,b,t,side,half}=best,key=a+'-'+b;
-    // sit just inside the edge that took the hit
-    w={key,a,b,t,side:Math.sign(side||1)*Math.min(Math.abs(side),half*.55),r:Math.min(half*(cut?.6:.8),size)};
-    d.partDmg[key]=(d.partDmg[key]||0)+dmg;
-    if(d.partDmg[key]>45){
-      if(/knee|foot/.test(key))d.legBroken=true;
-      if(/elbowB|handB/.test(key))d.armBroken.B=true;
-      if(/elbowF|handF/.test(key))d.armBroken.F=true;
-    }
-  }
-  w.cut=cut;
-  // a repeat hit on the same spot makes that wound worse instead of adding another
-  const same=d.wounds.find(o=>o.key===w.key&&o.cut===cut&&(w.key==='head'?Math.abs(o.ang-w.ang)<.5:Math.abs(o.t-w.t)<.15&&Math.sign(o.side)===Math.sign(w.side)));
-  if(same){same.r=Math.min(same.r*1.25,w.r*1.6);same.dark=Math.min(1,(same.dark||0)+.25)}
-  else d.wounds.push(w);
-  if(d.wounds.length>40)d.wounds.shift();
-}
-// each step: impact damage, bleeding, knockdowns, and getting back up
+// each step: the worst hit hurts, cuts bleed, knockdowns, and getting back up
 function updateDummy(d,grabbed){
   const P=d.pts;
-  let jolt=0,worst=0,at=null;
-  for(const p of d.list){
-    const vx=p.x-p.px,vy=p.y-p.py,j=Math.hypot(vx-p.vx,vy-p.vy);
-    if((p===P.hip||p===P.neck||p===P.head)&&j>jolt)jolt=j;
-    // an impact is speed lost against something; being yanked by a finger speeds a part up instead
-    const lost=(Math.hypot(p.vx,p.vy)-Math.hypot(vx,vy))*(p.hit?1:0);
-    if(lost>IMPACT&&(lost-IMPACT)*TOUGH[p.key]>(worst-IMPACT)*(at?TOUGH[at.key]:0)){worst=lost;at=p}
-    p.vx=vx;p.vy=vy;p.hit=false;
+  let jolt=0;
+  for(const p of [P.hip,P.neck,P.head]){
+    const vx=p.x-p.px,vy=p.y-p.py;
+    jolt=Math.max(jolt,Math.hypot(vx-p.vx,vy-p.vy));p.vx=vx;p.vy=vy;
   }
-  // one slam bounces for a few steps; only a harder follow-up hit counts again
+  let best=null,bestDmg=0,loudest=0;
+  for(const k in d.contacts){
+    const c=d.contacts[k];loudest=Math.max(loudest,c.speed);
+    if(c.speed<=IMPACT)continue;
+    const dmg=Math.min(35,(c.speed-IMPACT)*1.4)*c.sh.tough;
+    if(dmg>bestDmg){bestDmg=dmg;best=c}
+  }
+  d.contacts={};
   if(d.hurtCool>0)d.hurtCool--;
-  if(worst>IMPACT&&(d.hurtCool<=0||worst>d.lastHit+4)){
-    const dmg=Math.min(35,(worst-IMPACT)*1.4)*TOUGH[at.key];
-    // bounces right after a hit only add what goes beyond that hit, so one throw can't stack up a kill
-    const extra=d.hurtCool>0?dmg-d.lastDmg:dmg;
-    if(extra>2){hurt(d,at,at.nx,at.ny,extra);d.lastDmg=Math.max(dmg,d.hurtCool>0?d.lastDmg:0)}
-    d.hurtCool=12;d.lastHit=worst;
+  if(best){
+    // bounces right after a hit only add what goes beyond it, so one throw can't stack up a kill
+    const extra=d.hurtCool>0?bestDmg-d.lastDmg:bestDmg;
+    if(extra>2){hurtAt(d,best,extra);d.lastDmg=d.hurtCool>0?Math.max(d.lastDmg,bestDmg):bestDmg}
+    d.hurtCool=12;
+  }else if(loudest>7)thud(Math.min(.22,(loudest-7)*.03),false); // harmless bump
+  // cuts drip and drain health until they clot
+  let bleed=0;
+  for(const sp of d.spots){
+    sp.age++;
+    if(sp.bleed>.01){bleed+=sp.bleed;if(Math.random()<sp.bleed*.25)drip(d,sp);sp.bleed*=d.dead?.996:.998}
   }
-  // bleeding drains health and drips from the cuts
-  if(d.bleed>.02){
-    if(!d.dead){d.health-=d.bleed*.012;if(d.health<=0)die(d)}
-    const cuts=d.wounds.filter(w=>w.cut);
-    if(Math.random()<d.bleed*.15&&cuts.length)drip(d,cuts[Math.random()*cuts.length|0]);
-    d.bleed*=d.dead?.996:.998;
-  }
+  if(bleed&&!d.dead){d.health-=bleed*.012;if(d.health<=0)die(d)}
   if(d.hpShow>0)d.hpShow--;
   if(d.blink--<-7)d.blink=rnd(90,300);
   if(d.dead){d.strength=0;return}
@@ -274,40 +366,56 @@ function updateDummy(d,grabbed){
 }
 
 // ---- blood ----
-let drops=[],splats=[];
+let drops=[],splats=[],wallSplats=[],shake=0;
 const BLOOD=['#a5121d','#8c0d16','#c21b26'];
 // blood bursts out of the hit spot, away from whatever was hit
 function spray(x,y,nx,ny,dmg,s){
-  const n=Math.min(30,dmg*.8|0),tx=-ny,ty=nx;
+  const n=Math.min(34,6+dmg*.8|0),tx=-ny,ty=nx;
   for(let i=0;i<n;i++){
-    const out=rnd(1,4.5),side=rnd(-3,3);
-    drops.push({x,y,vx:-nx*out+tx*side,vy:-ny*out+ty*side-rnd(0,2),r:rnd(.7,1.5)*s,c:BLOOD[i%3]});
+    const out=rnd(1,5),side=rnd(-3.5,3.5);
+    drops.push({x:x-nx*2,y:y-ny*2,vx:-nx*out+tx*side,vy:-ny*out+ty*side-rnd(0,2.5),r:rnd(.7,1.6)*s,c:BLOOD[i%3]});
   }
 }
-// wounds are stored relative to their body part so they move and turn with it
-function woundPos(d,w){
-  if(w.key==='head'){
-    const h=d.pts.head,n=d.pts.neck,a=Math.atan2(h.y-n.y,h.x-n.x)+w.ang,dist=h.r-w.r*.9;
-    return {x:h.x+Math.cos(a)*dist,y:h.y+Math.sin(a)*dist};
-  }
-  const A=d.pts[w.a],B=d.pts[w.b],dx=B.x-A.x,dy=B.y-A.y,len=Math.hypot(dx,dy)||1;
-  return {x:A.x+dx*w.t-dy/len*w.side,y:A.y+dy*w.t+dx/len*w.side};
-}
-function drip(d,w){
-  const {x,y}=woundPos(d,w);
+function drip(d,sp){
+  const {x,y}=spotPos(d,sp);
   drops.push({x,y,vx:rnd(-.4,.4),vy:rnd(0,1),r:rnd(.7,1.3)*d.s,c:BLOOD[Math.random()*3|0]});
 }
 function updateBlood(){
   for(const q of drops){
     q.vy+=GRAVITY*.8;q.x+=q.vx;q.y+=q.vy;
-    if(q.y>=groundY){ // lands as a splat on the floor
-      splats.push({x:q.x,w:q.r*rnd(1.6,3.2),h:q.r*rnd(.45,.8),c:q.c});
-      q.dead=true;
-    }else if(q.x<-20||q.x>VW+20)q.dead=true;
+    if(q.y>=groundY){ // lands as a puddle on the floor
+      splats.push({x:q.x,w:q.r*rnd(1.6,3.2),h:q.r*rnd(.45,.8),c:q.c});q.dead=true;
+    }else if(q.x<=0||q.x>=VW){ // or a streak on the wall
+      wallSplats.push({x:q.x<=0?0:VW,y:q.y,w:q.r*rnd(.5,.8),h:q.r*rnd(1.4,3),c:q.c});q.dead=true;
+    }
   }
   drops=drops.filter(q=>!q.dead);
   if(drops.length>700)drops.splice(0,drops.length-700);
   if(splats.length>500)splats.splice(0,splats.length-500);
+  if(wallSplats.length>300)wallSplats.splice(0,wallSplats.length-300);
+}
+
+// ---- sound: a soft thud for bumps, a heavier one with a wet slap for cuts ----
+let ac=null,noise=null,lastSound=0,muted=false;
+try{muted=localStorage.getItem('dummy-yard-muted')==='1'}catch(e){}
+function unlockAudio(){
+  if(!ac){
+    try{ac=new (window.AudioContext||window.webkitAudioContext)()}catch(e){return}
+    const len=Math.floor(ac.sampleRate*.1);noise=ac.createBuffer(1,len,ac.sampleRate);
+    const ch=noise.getChannelData(0);for(let i=0;i<len;i++)ch[i]=(Math.random()*2-1)*(1-i/len)**2;
+  }
+  if(ac.state==='suspended')ac.resume();
+}
+function thud(vol,wet){
+  if(muted||!ac||vol<.01)return;
+  const now=ac.currentTime;if(now-lastSound<.035)return;lastSound=now;
+  const o=ac.createOscillator(),g=ac.createGain();
+  o.type='sine';o.frequency.setValueAtTime(105+rnd(-15,15),now);o.frequency.exponentialRampToValueAtTime(40,now+.14);
+  g.gain.setValueAtTime(vol,now);g.gain.exponentialRampToValueAtTime(.001,now+.18);
+  o.connect(g).connect(ac.destination);o.start(now);o.stop(now+.2);
+  const src=ac.createBufferSource(),f=ac.createBiquadFilter(),g2=ac.createGain();
+  src.buffer=noise;f.type=wet?'bandpass':'lowpass';f.frequency.value=wet?1000:650;g2.gain.value=vol*(wet?1.3:.7);
+  src.connect(f).connect(g2).connect(ac.destination);src.start(now);
 }
 
 function integrate(p){
@@ -316,14 +424,16 @@ function integrate(p){
   p.px=p.x;p.py=p.y;
   p.x+=vx;p.y+=vy+GRAVITY;
 }
+// floor and walls; remembers how fast each joint hit them
 function bounds(p){
   if(p.y>groundY-p.r){
-    p.y=groundY-p.r;p.hit=true;p.nx=0;p.ny=1;
+    p.hitSpeed=Math.max(p.hitSpeed,p.y-p.py,.001);p.nx=0;p.ny=1;
+    p.y=groundY-p.r;
     p.px=p.x-(p.x-p.px)*.75; // ground friction
     if(p.py<p.y)p.py=p.y;     // no bounce
   }
-  if(p.x<p.r){p.x=p.r;p.px=p.x+(p.x-p.px)*-.3;p.hit=true;p.nx=-1;p.ny=0}
-  if(p.x>VW-p.r){p.x=VW-p.r;p.px=p.x+(p.x-p.px)*-.3;p.hit=true;p.nx=1;p.ny=0}
+  if(p.x<p.r){p.hitSpeed=Math.max(p.hitSpeed,p.px-p.x,.001);p.nx=-1;p.ny=0;p.x=p.r;p.px=p.x+(p.x-p.px)*-.3}
+  if(p.x>VW-p.r){p.hitSpeed=Math.max(p.hitSpeed,p.x-p.px,.001);p.nx=1;p.ny=0;p.x=VW-p.r;p.px=p.x+(p.x-p.px)*-.3}
 }
 function solveStick(st){
   const a=st.a,b=st.b,dx=b.x-a.x,dy=b.y-a.y,d=Math.hypot(dx,dy)||.001;
@@ -336,27 +446,7 @@ function solveStick(st){
 function holdGrabs(){
   for(const g of grabs.values()){
     const {a,b,t}=g;
-    const dx=g.tx-(a.x+(b.x-a.x)*t),dy=g.ty-(a.y+(b.y-a.y)*t);
-    if(a===b){a.x+=dx;a.y+=dy;continue}
-    const wa=1-t,wb=t,den=wa*wa+wb*wb;
-    a.x+=dx*wa/den;a.y+=dy*wa/den;
-    b.x+=dx*wb/den;b.y+=dy*wb/den;
-  }
-}
-// dummies bump into each other (not themselves)
-function collideDummies(){
-  for(let i=0;i<dummies.length;i++)for(let j=i+1;j<dummies.length;j++){
-    for(const p of dummies[i].list)for(const q of dummies[j].list){
-      const dx=q.x-p.x,dy=q.y-p.y,min=p.r+q.r;
-      if(Math.abs(dx)>min||Math.abs(dy)>min)continue;
-      const d=Math.hypot(dx,dy)||.001;
-      if(d>=min)continue;
-      const push=(min-d)/d*.5;
-      p.x-=dx*push;p.y-=dy*push;
-      q.x+=dx*push;q.y+=dy*push;
-      p.hit=q.hit=true;
-      p.nx=dx/d;p.ny=dy/d;q.nx=-dx/d;q.ny=-dy/d;
-    }
+    shove(a,b,t,g.tx-(a.x+(b.x-a.x)*t),g.ty-(a.y+(b.y-a.y)*t));
   }
 }
 function step(){
@@ -367,7 +457,7 @@ function step(){
     holdGrabs(); // last, so the held part stays right under the finger
   }
   const held=new Set([...grabs.values()].map(g=>g.d));
-  for(const d of dummies)updateDummy(d,held.has(d));
+  for(const d of dummies){surfaceContacts(d);updateDummy(d,held.has(d))}
   updateBlood();
 }
 
@@ -380,7 +470,7 @@ function limb(a,b,w,fill){
   ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
 }
 function jointDot(p,r){ctx.fillStyle=COL.joint;ctx.beginPath();ctx.arc(p.x,p.y,r,0,Math.PI*2);ctx.fill()}
-// outline of a limb (a capsule) or the head, used to keep wounds painted on the skin
+// outline of a limb (a capsule) or the head, used to keep injuries painted on the skin
 function partPath(a,b,half){
   ctx.beginPath();
   if(a===b){ctx.arc(a.x,a.y,a.r,0,Math.PI*2);return}
@@ -389,20 +479,26 @@ function partPath(a,b,half){
   ctx.arc(a.x,a.y,half,ang+Math.PI/2,ang+Math.PI*1.5);
   ctx.closePath();
 }
-function drawWounds(d,key,a,b,half){
-  const list=d.wounds.filter(w=>w.key===key);
+function drawSpots(d,sh,A,B,half){
+  const list=d.spots.filter(o=>o.key===sh.key);
   if(!list.length)return;
-  ctx.save();partPath(a,b,half);ctx.clip();
-  for(const w of list){
-    const {x,y}=woundPos(d,w),dark=w.dark||0;
-    if(w.cut){ // open cut: dark rim, wet red middle
-      ctx.fillStyle='rgba(120,70,110,.35)';ctx.beginPath();ctx.arc(x,y,w.r*1.7,0,Math.PI*2);ctx.fill();
-      ctx.fillStyle='#6e0a11';ctx.beginPath();ctx.arc(x,y,w.r,0,Math.PI*2);ctx.fill();
-      ctx.fillStyle='#b8161f';ctx.beginPath();ctx.arc(x,y,w.r*.55,0,Math.PI*2);ctx.fill();
-    }else{ // bruise: soft purple patch that darkens with repeat hits
-      const g=ctx.createRadialGradient(x,y,0,x,y,w.r);
-      g.addColorStop(0,`rgba(96,58,118,${.5+dark*.3})`);g.addColorStop(1,'rgba(96,58,118,0)');
-      ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,w.r,0,Math.PI*2);ctx.fill();
+  ctx.save();partPath(A,B,half);ctx.clip();
+  for(const sp of list){
+    const {x,y,ang}=spotPos(d,sp),base=sh.key==='head'?A.r*.55:half;
+    if(sp.bruise>0){ // fresh red, darkening to purple over a few seconds
+      const k=Math.min(1,sp.age/240),r=165-70*k|0,g=55-5*k|0,b=75+45*k|0;
+      const R=base*(.55+.4*Math.min(1.2,sp.bruise)),a=.3+.35*Math.min(1,sp.bruise);
+      const gr=ctx.createRadialGradient(x,y,0,x,y,R);
+      gr.addColorStop(0,`rgba(${r},${g},${b},${a})`);gr.addColorStop(.6,`rgba(${r},${g},${b},${a*.6})`);gr.addColorStop(1,`rgba(${r},${g},${b},0)`);
+      ctx.fillStyle=gr;ctx.beginPath();ctx.arc(x,y,R,0,Math.PI*2);ctx.fill();
+    }
+    if(sp.cut>0){ // a gash running along the skin, wet while it still bleeds
+      const L=base*(.4+.45*Math.min(1,sp.cut)),W=Math.max(1,base*(.12+.12*Math.min(1,sp.cut)));
+      ctx.save();ctx.translate(x,y);ctx.rotate(ang);
+      ctx.fillStyle='#5c0910';ctx.beginPath();ctx.ellipse(0,0,L,W*1.5,0,0,Math.PI*2);ctx.fill();
+      ctx.fillStyle='#b3141e';ctx.beginPath();ctx.ellipse(0,0,L*.8,W*.8,0,0,Math.PI*2);ctx.fill();
+      if(sp.bleed>.05){ctx.fillStyle='rgba(255,140,140,.45)';ctx.beginPath();ctx.ellipse(-L*.25,-W*.3,L*.25,W*.3,0,0,Math.PI*2);ctx.fill()}
+      ctx.restore();
     }
   }
   ctx.restore();
@@ -433,26 +529,20 @@ function drawHealth(d){
   ctx.fillRect(x,y,w*d.health/100,4);
   ctx.globalAlpha=1;
 }
-// back limbs first, slightly darker, so the figure reads in depth
-const DRAW_ORDER=[
-  ['hip','kneeB',9,1],['kneeB','footB',8,1],['neck','elbowB',7.5,1],['elbowB','handB',7,1],
-  ['neck','hip',17,0],['hip','kneeF',9,0],['kneeF','footF',8,0],['head'],
-  ['neck','elbowF',7.5,0],['elbowF','handF',7,0],
-];
 function drawDummy(d){
   const P=d.pts,s=d.s;
-  for(const [a,b,w,back] of DRAW_ORDER){
-    if(a==='head'){
-      const h=P.head;
-      ctx.fillStyle=COL.outline;ctx.beginPath();ctx.arc(h.x,h.y,h.r+1.25,0,Math.PI*2);ctx.fill();
-      ctx.fillStyle=COL.body;ctx.beginPath();ctx.arc(h.x,h.y,h.r,0,Math.PI*2);ctx.fill();
-      drawWounds(d,'head',h,h,h.r);drawEyes(d);
+  for(const sh of SHAPES){
+    const A=P[sh.a],B=P[sh.b];
+    if(sh.key==='head'){
+      ctx.fillStyle=COL.outline;ctx.beginPath();ctx.arc(A.x,A.y,A.r+1.25,0,Math.PI*2);ctx.fill();
+      ctx.fillStyle=COL.body;ctx.beginPath();ctx.arc(A.x,A.y,A.r,0,Math.PI*2);ctx.fill();
+      drawSpots(d,sh,A,A,A.r);drawEyes(d);
       continue;
     }
-    limb(P[a],P[b],w*s,back?COL.bodyBack:COL.body);
-    drawWounds(d,a+'-'+b,P[a],P[b],w*s/2);
-    if(b==='footF')jointDot(P.kneeF,1.6*s);
-    if(b==='handF')jointDot(P.elbowF,1.4*s);
+    limb(A,B,sh.w*s,sh.back?COL.bodyBack:COL.body);
+    drawSpots(d,sh,A,B,sh.w*s/2);
+    if(sh.b==='footF')jointDot(P.kneeF,1.6*s);
+    if(sh.b==='handF')jointDot(P.elbowF,1.4*s);
   }
 }
 // glow around the body part a finger is holding
@@ -469,6 +559,8 @@ function drawGrab(g){
 function draw(){
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.fillStyle=COL.sky;ctx.fillRect(0,0,VW,VH);
+  // a hard hit shakes the view for a moment
+  if(shake>.3){ctx.translate(rnd(-shake,shake),rnd(-shake,shake));shake*=.85}else shake=0;
   ctx.strokeStyle=COL.grid;ctx.lineWidth=1;ctx.beginPath();
   for(let x=40;x<VW;x+=40){ctx.moveTo(x+.5,0);ctx.lineTo(x+.5,groundY)}
   for(let y=groundY-40;y>0;y-=40){ctx.moveTo(0,y+.5);ctx.lineTo(VW,y+.5)}
@@ -476,6 +568,7 @@ function draw(){
   ctx.fillStyle=COL.ground;ctx.fillRect(0,groundY,VW,VH-groundY);
   ctx.fillStyle=COL.groundTop;ctx.fillRect(0,groundY,VW,3);
   for(const sp of splats){ctx.fillStyle=sp.c;ctx.beginPath();ctx.ellipse(sp.x,groundY+1,sp.w,sp.h,0,0,Math.PI*2);ctx.fill()}
+  for(const sp of wallSplats){ctx.fillStyle=sp.c;ctx.beginPath();ctx.ellipse(sp.x,sp.y,sp.w,sp.h,0,0,Math.PI*2);ctx.fill()}
   for(const d of dummies)drawDummy(d);
   for(const q of drops){ctx.fillStyle=q.c;ctx.beginPath();ctx.arc(q.x,q.y,q.r,0,Math.PI*2);ctx.fill()}
   for(const g of grabs.values())drawGrab(g);
@@ -515,12 +608,6 @@ for(const t of TOOLS){
   tray.append(b);
 }
 
-// body parts you can grab, front-most last: [from joint, to joint, drawn width]
-const PARTS=[
-  ['kneeB','footB',8],['hip','kneeB',9],['elbowB','handB',7],['neck','elbowB',7.5],
-  ['neck','hip',17],['kneeF','footF',8],['hip','kneeF',9],['head','head',0],
-  ['elbowF','handF',7],['neck','elbowF',7.5],
-];
 // the body part under a fingertip, and how far along it the finger landed.
 // When parts overlap, the one drawn on top wins; otherwise the nearest within reach.
 function pick(x,y){
@@ -542,7 +629,7 @@ function pick(x,y){
 const grabs=new Map();
 const pos=e=>{const r=cv.getBoundingClientRect();return {x:e.clientX-r.left,y:e.clientY-r.top}};
 cv.addEventListener('pointerdown',e=>{
-  e.preventDefault();
+  e.preventDefault();unlockAudio(); // browsers only allow sound after a touch
   const {x,y}=pos(e);
   if(tool==='dummy'){
     const s=scale();
@@ -573,12 +660,20 @@ const ICON_TRASH='<svg viewBox="0 0 24 24"><path d="M9 3h6l1 2h4v2H4V5h4zM6 9h12
 const pauseBtn=document.getElementById('pauseBtn'),pausedTag=document.getElementById('pausedTag');
 function showPause(){pauseBtn.innerHTML=paused?ICON_PLAY:ICON_PAUSE;pauseBtn.setAttribute('aria-label',paused?'Play':'Pause');pausedTag.hidden=!paused}
 pauseBtn.addEventListener('click',()=>{paused=!paused;showPause()});showPause();
+const soundBtn=document.getElementById('soundBtn');
+const ICON_SOUND='<svg viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+const ICON_MUTED='<svg viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16 9l5 6M21 9l-5 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+function showSound(){soundBtn.innerHTML=muted?ICON_MUTED:ICON_SOUND;soundBtn.setAttribute('aria-label',muted?'Turn sound on':'Turn sound off')}
+soundBtn.addEventListener('click',()=>{
+  muted=!muted;unlockAudio();showSound();
+  try{localStorage.setItem('dummy-yard-muted',muted?'1':'0')}catch(e){}
+});showSound();
 const slowBtn=document.getElementById('slowBtn');
 slowBtn.addEventListener('click',()=>{slow=!slow;slowBtn.textContent=slow?'¼×':'1×'});
 const clearBtn=document.getElementById('clearBtn');let armed=0;
 function showClear(){clearBtn.innerHTML=armed?'Tap to clear':ICON_TRASH;clearBtn.classList.toggle('warn',!!armed)}
 clearBtn.addEventListener('click',()=>{
-  if(armed){clearTimeout(armed);armed=0;dummies=[];drops=[];splats=[];grabs.clear()}
+  if(armed){clearTimeout(armed);armed=0;dummies=[];drops=[];splats=[];wallSplats=[];grabs.clear()}
   else armed=setTimeout(()=>{armed=0;showClear()},2500);
   showClear();
 });showClear();
@@ -601,7 +696,7 @@ function frame(now){
 fit();
 new ResizeObserver(fit).observe(stage);
 makeDummy(VW*.5,groundY-(SKELETON.footF[1]+RADIUS.footF)*scale()); // standing on the ground
-window.__yard={dummies:()=>dummies,groundY:()=>groundY,pick,blood:()=>({drops:drops.length,splats:splats.length})}; // for testing from the console
+window.__yard={dummies:()=>dummies,groundY:()=>groundY,pick,blood:()=>({drops:drops.length,splats:splats.length,wall:wallSplats.length}),SHAPES}; // for testing from the console
 requestAnimationFrame(frame);
 
 // cache the game on the device so it opens with no connection

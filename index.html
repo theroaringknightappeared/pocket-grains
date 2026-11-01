@@ -100,14 +100,16 @@ try{localStorage.removeItem('pocket-grains-world')}catch(e){}
 
 const cv=document.getElementById('cv'),ctx=cv.getContext('2d'),stage=document.getElementById('stage');
 const COL={sky:'#252b33',grid:'#2c333c',ground:'#3b424c',groundTop:'#4a525d',
-  body:'#dfe2e5',bodyBack:'#c3c8cd',outline:'#5d6670',joint:'#b5bbc2'};
+  body:'#dfe2e5',bodyBack:'#c3c8cd',outline:'#5d6670',joint:'#b5bbc2',grab:'#f2b544'};
 
 let VW=0,VH=0,dpr=1,groundY=0;
 const GROUND_H=44;
-const scale=()=>Math.max(.85,Math.min(1.5,Math.min(VW,VH)/400));
+// a standing dummy is ~115 units tall; size it to about 40% of the yard's height
+const scale=()=>Math.max(.8,Math.min(3.2,Math.min(VH*.4,VW*.75)/115));
 
 // ---- Verlet physics: each dummy is points joined by sticks ----
-const GRAVITY=.42,DAMP=.995,ITER=10;
+const GRAVITY=.55,DAMP=.995,ITER=10;
+const KNOCKDOWN=13; // sudden speed change (px/step) that knocks a dummy off its feet
 let dummies=[];
 
 // joint layout in body units (1 unit ≈ 1px at scale 1), hip at origin
@@ -135,13 +137,46 @@ function makeDummy(x,y){
   const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
   for(const [a,b] of BONES)sticks.push({a:pts[a],b:pts[b],len:dist(pts[a],pts[b]),type:'fixed'});
   for(const [a,b,type,f] of BRACES)sticks.push({a:pts[a],b:pts[b],len:dist(pts[a],pts[b])*(f||1),type,stiff:type==='fixed'?.5:1});
-  const d={pts,list:Object.values(pts),sticks,s};
+  for(const p of Object.values(pts)){p.vx=0;p.vy=0}
+  const d={pts,list:Object.values(pts),sticks,s,strength:1,recover:0};
   dummies.push(d);
   return d;
 }
 
+// ---- balance: muscles ease each joint toward its standing pose, measured from the hip ----
+const MUSCLE={neck:.2,head:.2,kneeB:.12,kneeF:.12,footB:.1,footF:.1,elbowB:.04,elbowF:.04,handB:.03,handF:.03};
+function pull(p,x,y,k){
+  const dx=(x-p.x)*k,dy=(y-p.y)*k;
+  p.x+=dx;p.y+=dy;p.px+=dx*.85;p.py+=dy*.85; // mostly a nudge, little added speed
+}
+function balance(d){
+  const st=d.strength;if(st<=0)return;
+  const P=d.pts,s=d.s,footR=P.footF.r;
+  const grounded=P.footB.y>groundY-footR-3*s||P.footF.y>groundY-footR-3*s;
+  if(grounded){
+    // legs carry the body's weight, and push the hip up to standing height over the feet
+    for(const p of d.list)if(p!==P.footB&&p!==P.footF)p.y-=GRAVITY*st;
+    pull(P.hip,(P.footB.x+P.footF.x)/2,groundY-footR-SKELETON.footF[1]*s,.15*st);
+  }
+  for(const k in MUSCLE)pull(P[k],P.hip.x+SKELETON[k][0]*s,P.hip.y+SKELETON[k][1]*s,MUSCLE[k]*st);
+}
+// knocked down by a hard hit, then slowly gets back up
+function updateStrength(d,grabbed){
+  let jolt=0;
+  for(const k of ['hip','neck','head']){
+    const p=d.pts[k],vx=p.x-p.px,vy=p.y-p.py;
+    jolt=Math.max(jolt,Math.hypot(vx-p.vx,vy-p.vy));
+    p.vx=vx;p.vy=vy;
+  }
+  // a hard landing buckles the legs
+  const P=d.pts,footY=groundY-P.footF.r-2;
+  const landing=(P.footB.y>footY||P.footF.y>footY)&&P.hip.vy>8;
+  if(grabbed||jolt>KNOCKDOWN||landing){d.strength=0;d.recover=grabbed?40:90;return}
+  if(d.recover>0)d.recover--;
+  else d.strength=Math.min(1,d.strength+.012);
+}
+
 function integrate(p){
-  if(p.held)return;
   let vx=(p.x-p.px)*DAMP,vy=(p.y-p.py)*DAMP;
   const max=45;vx=Math.max(-max,Math.min(max,vx));vy=Math.max(-max,Math.min(max,vy));
   p.px=p.x;p.py=p.y;
@@ -151,7 +186,7 @@ function bounds(p){
   if(p.y>groundY-p.r){
     p.y=groundY-p.r;
     p.px=p.x-(p.x-p.px)*.75; // ground friction
-    if(p.py<p.y)p.py=p.y+(p.py-p.y)*0; // stop the bounce
+    if(p.py<p.y)p.py=p.y;     // no bounce
   }
   if(p.x<p.r){p.x=p.r;p.px=p.x+(p.x-p.px)*-.3}
   if(p.x>VW-p.r){p.x=VW-p.r;p.px=p.x+(p.x-p.px)*-.3}
@@ -161,10 +196,18 @@ function solveStick(st){
   if(st.type==='min'&&d>=st.len)return;
   const diff=(d-st.len)/d*.5*(st.stiff||1);
   const ox=dx*diff,oy=dy*diff;
-  const wa=a.held?0:1,wb=b.held?0:1,w=wa+wb;
-  if(!w)return;
-  a.x+=ox*2*wa/w;a.y+=oy*2*wa/w;
-  b.x-=ox*2*wb/w;b.y-=oy*2*wb/w;
+  a.x+=ox;a.y+=oy;b.x-=ox;b.y-=oy;
+}
+// a grabbed body part is pinned to the finger at the spot where it was touched
+function holdGrabs(){
+  for(const g of grabs.values()){
+    const {a,b,t}=g;
+    const dx=g.tx-(a.x+(b.x-a.x)*t),dy=g.ty-(a.y+(b.y-a.y)*t);
+    if(a===b){a.x+=dx;a.y+=dy;continue}
+    const wa=1-t,wb=t,den=wa*wa+wb*wb;
+    a.x+=dx*wa/den;a.y+=dy*wa/den;
+    b.x+=dx*wb/den;b.y+=dy*wb/den;
+  }
 }
 // dummies bump into each other (not themselves)
 function collideDummies(){
@@ -175,17 +218,20 @@ function collideDummies(){
       const d=Math.hypot(dx,dy)||.001;
       if(d>=min)continue;
       const push=(min-d)/d*.5;
-      if(!p.held){p.x-=dx*push;p.y-=dy*push}
-      if(!q.held){q.x+=dx*push;q.y+=dy*push}
+      p.x-=dx*push;p.y-=dy*push;
+      q.x+=dx*push;q.y+=dy*push;
     }
   }
 }
 function step(){
-  for(const d of dummies)for(const p of d.list)integrate(p);
+  for(const d of dummies){for(const p of d.list)integrate(p);balance(d)}
   for(let k=0;k<ITER;k++){
     for(const d of dummies){for(const st of d.sticks)solveStick(st);for(const p of d.list)bounds(p)}
     if(k%3===0)collideDummies();
+    holdGrabs(); // last, so the held part stays right under the finger
   }
+  const held=new Set([...grabs.values()].map(g=>g.d));
+  for(const d of dummies)updateStrength(d,held.has(d));
 }
 
 // ---- drawing ----
@@ -215,6 +261,17 @@ function drawDummy(d){
   limb(P.neck,P.elbowF,7.5*s,COL.body);limb(P.elbowF,P.handF,7*s,COL.body);
   jointDot(P.elbowF,1.4*s);
 }
+// glow around the body part a finger is holding
+function drawGrab(g){
+  const s=g.d.s;
+  ctx.globalAlpha=.45;ctx.strokeStyle=COL.grab;ctx.lineCap='round';
+  if(g.a===g.b){
+    ctx.lineWidth=4;ctx.beginPath();ctx.arc(g.a.x,g.a.y,g.a.r+4,0,Math.PI*2);ctx.stroke();
+  }else{
+    ctx.lineWidth=g.w*s+8;ctx.beginPath();ctx.moveTo(g.a.x,g.a.y);ctx.lineTo(g.b.x,g.b.y);ctx.stroke();
+  }
+  ctx.globalAlpha=1;
+}
 function draw(){
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.fillStyle=COL.sky;ctx.fillRect(0,0,VW,VH);
@@ -225,10 +282,7 @@ function draw(){
   ctx.fillStyle=COL.ground;ctx.fillRect(0,groundY,VW,VH-groundY);
   ctx.fillStyle=COL.groundTop;ctx.fillRect(0,groundY,VW,3);
   for(const d of dummies)drawDummy(d);
-  for(const g of grabs.values()){
-    ctx.strokeStyle='rgba(242,181,68,.9)';ctx.lineWidth=2;
-    ctx.beginPath();ctx.arc(g.p.x,g.p.y,g.p.r+5,0,Math.PI*2);ctx.stroke();
-  }
+  for(const g of grabs.values())drawGrab(g);
 }
 
 // ---- sizing ----
@@ -263,46 +317,54 @@ for(const t of TOOLS){
   tray.append(b);
 }
 
-// nearest joint within reach of a fingertip
+// body parts you can grab, front-most last: [from joint, to joint, drawn width]
+const PARTS=[
+  ['kneeB','footB',8],['hip','kneeB',9],['elbowB','handB',7],['neck','elbowB',7.5],
+  ['neck','hip',17],['kneeF','footF',8],['hip','kneeF',9],['head','head',0],
+  ['elbowF','handF',7],['neck','elbowF',7.5],
+];
+// the body part under a fingertip, and how far along it the finger landed.
+// When parts overlap, the one drawn on top wins; otherwise the nearest within reach.
 function pick(x,y){
-  let best=null,bd=Infinity;
-  for(const d of dummies)for(const p of d.list){
-    const dd=Math.hypot(p.x-x,p.y-y)-p.r;
-    if(dd<bd){bd=dd;best={d,p}}
+  let top=null,best=null,bd=14; // forgiving reach for fingers
+  for(const d of dummies)for(const [ka,kb,w] of PARTS){
+    const a=d.pts[ka],b=d.pts[kb];
+    let t=0,gap;
+    if(a===b)gap=Math.hypot(x-a.x,y-a.y)-a.r;
+    else{
+      const dx=b.x-a.x,dy=b.y-a.y;
+      t=Math.max(0,Math.min(1,((x-a.x)*dx+(y-a.y)*dy)/(dx*dx+dy*dy)));
+      gap=Math.hypot(x-a.x-dx*t,y-a.y-dy*t)-w*d.s/2;
+    }
+    if(gap<=0)top={d,a,b,t,w}; // later parts are drawn in front
+    else if(gap<bd){bd=gap;best={d,a,b,t,w}}
   }
-  return bd<28?best:null;
+  return top||best;
 }
 const grabs=new Map();
 const pos=e=>{const r=cv.getBoundingClientRect();return {x:e.clientX-r.left,y:e.clientY-r.top}};
 cv.addEventListener('pointerdown',e=>{
   e.preventDefault();
   const {x,y}=pos(e);
-  if(tool==='dummy'){makeDummy(x,Math.min(y,groundY-48*scale()));return}
+  if(tool==='dummy'){
+    const s=scale();
+    makeDummy(x,Math.min(y,groundY-(SKELETON.footF[1]+RADIUS.footF)*s));
+    return;
+  }
   const hit=pick(x,y);
   if(!hit)return;
   if(tool==='remove'){dummies=dummies.filter(d=>d!==hit.d);for(const [id,g] of grabs)if(g.d===hit.d)grabs.delete(id);return}
   try{cv.setPointerCapture(e.pointerId)}catch(_){}
-  hit.p.held=true;
-  grabs.set(e.pointerId,{...hit,tx:x,ty:y,lx:x,ly:y});
+  grabs.set(e.pointerId,{...hit,tx:x,ty:y});
 });
 cv.addEventListener('pointermove',e=>{
   const g=grabs.get(e.pointerId);if(!g)return;
-  const {x,y}=pos(e);g.tx=x;g.ty=Math.min(y,groundY-g.p.r);
+  const {x,y}=pos(e);g.tx=x;g.ty=Math.min(y,groundY-4);
 });
-const release=e=>{
-  const g=grabs.get(e.pointerId);if(!g)return;
-  g.p.held=false;grabs.delete(e.pointerId);
-};
+const release=e=>grabs.delete(e.pointerId);
 cv.addEventListener('pointerup',release);cv.addEventListener('pointercancel',release);
 document.addEventListener('gesturestart',e=>e.preventDefault());
 document.addEventListener('dblclick',e=>e.preventDefault());
-// held joints follow the finger; their last move becomes fling speed on release
-function moveGrabs(){
-  for(const g of grabs.values()){
-    g.p.px=g.p.x;g.p.py=g.p.y;
-    g.p.x+= (g.tx-g.p.x)*.6;g.p.y+=(g.ty-g.p.y)*.6;
-  }
-}
 
 // ---- top bar ----
 let paused=false,slow=false;
@@ -332,14 +394,15 @@ function frame(now){
   acc+=Math.min(100,now-last);last=now;
   while(acc>=1000/60){
     acc-=1000/60;
-    if(!paused&&(!slow||(slowTick++%4===0))){moveGrabs();step()}
+    if(!paused&&(!slow||(slowTick++%4===0)))step()
   }
   draw();
   requestAnimationFrame(frame);
 }
 fit();
 new ResizeObserver(fit).observe(stage);
-makeDummy(VW*.5,groundY-120*scale());
+makeDummy(VW*.5,groundY-(SKELETON.footF[1]+RADIUS.footF)*scale()); // standing on the ground
+window.__yard={dummies:()=>dummies,groundY:()=>groundY,pick}; // for testing from the console
 requestAnimationFrame(frame);
 
 // cache the game on the device so it opens with no connection
